@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "tsx src/index.tsx",
-    "build": "tsup src/index.tsx --format esm --banner.js '#!/usr/bin/env node'",
+    "build": "tsup",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
