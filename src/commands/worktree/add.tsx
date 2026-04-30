@@ -74,7 +74,7 @@ export function WorktreeAdd({ name }: Props) {
       updateStep(0, { status: "running" });
       try {
         mainPath = await getMainWorktreePath();
-        destPath = path.join(mainPath, "..", name);
+        destPath = path.join(mainPath, name);
         updateStep(0, {
           label: `Creating worktree at ${path.relative(process.cwd(), destPath)}`,
         });
