@@ -1,7 +1,9 @@
 import * as path from "node:path";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdin } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Footer } from "../../components/Footer.js";
+import { useQuit } from "../../hooks/useQuit.js";
 import { run } from "../../utils/exec.js";
 import {
   addWorktree,
@@ -42,6 +44,8 @@ function stepColor(status: StepStatus): "blue" | "green" | "red" | "gray" {
 type Props = { name: string };
 
 export function WorktreeAdd({ name }: Props) {
+  useQuit();
+  const { isRawModeSupported } = useStdin();
   const [phase, setPhase] = useState<Phase>({ type: "checking" });
   const [steps, setSteps] = useState<StepState[]>([
     { label: "Creating worktree", status: "pending" },
@@ -136,7 +140,7 @@ export function WorktreeAdd({ name }: Props) {
     } else if (input === "n" || input === "N") {
       void execute(null);
     }
-  });
+  }, { isActive: isRawModeSupported === true });
 
   const showSteps =
     phase.type === "running" || phase.type === "done" || phase.type === "error";
@@ -181,6 +185,7 @@ export function WorktreeAdd({ name }: Props) {
       )}
 
       {phase.type === "done" && <Text color="green">Done!</Text>}
+      <Footer />
     </Box>
   );
 }

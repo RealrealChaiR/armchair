@@ -1,4 +1,6 @@
 import { Box, Text } from "ink";
+import { Footer } from "./components/Footer.js";
+import { useQuit } from "./hooks/useQuit.js";
 
 const COMMANDS = [
   {
@@ -8,6 +10,7 @@ const COMMANDS = [
 ] as const;
 
 export function App() {
+  useQuit();
   return (
     <Box flexDirection="column" padding={1} gap={1}>
       <Box gap={1}>
@@ -25,6 +28,7 @@ export function App() {
           </Box>
         ))}
       </Box>
+      <Footer />
     </Box>
   );
 }
