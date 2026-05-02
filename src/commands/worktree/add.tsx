@@ -9,6 +9,7 @@ import {
   addWorktree,
   checkRemoteBranch,
   copyEnvFile,
+  getMainBranchWorktreePath,
   getMainWorktreePath,
 } from "../../utils/worktree.js";
 
@@ -41,9 +42,9 @@ function stepColor(status: StepStatus): "blue" | "green" | "red" | "gray" {
   return "gray";
 }
 
-type Props = { name: string };
+type Props = { name: string; onDone?: () => void };
 
-export function WorktreeAdd({ name }: Props) {
+export function WorktreeAdd({ name, onDone }: Props) {
   useQuit();
   const { isRawModeSupported } = useStdin();
   const [phase, setPhase] = useState<Phase>({ type: "checking" });
@@ -88,7 +89,10 @@ export function WorktreeAdd({ name }: Props) {
 
       updateStep(1, { status: "running" });
       try {
-        const copied = await copyEnvFile(mainPath, destPath);
+        const mainBranchPath = await getMainBranchWorktreePath();
+        const copied = mainBranchPath
+          ? await copyEnvFile(mainBranchPath, destPath)
+          : false;
         updateStep(1, {
           status: "done",
           label: copied ? "Copied .env" : ".env not found, skipped",
@@ -129,6 +133,13 @@ export function WorktreeAdd({ name }: Props) {
     }
     void check();
   }, [name, execute]);
+
+  useEffect(() => {
+    if (phase.type === "done" && onDone) {
+      const t = setTimeout(onDone, 1000);
+      return () => clearTimeout(t);
+    }
+  }, [phase.type, onDone]);
 
   useInput((input, key) => {
     if (phase.type !== "confirm") {

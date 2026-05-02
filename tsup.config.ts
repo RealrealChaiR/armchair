@@ -5,4 +5,5 @@ export default defineConfig({
 	format: ["esm"],
 	banner: { js: "#!/usr/bin/env node" },
 	clean: true,
+	external: ["node-pty"],
 });
