@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { Box, Text, useApp, useInput, useStdin } from "ink";
 import { useCallback, useEffect, useState } from "react";
 
+import { WorktreeAdd } from "./add.js";
 import { Footer } from "../../components/Footer.js";
 import { loadConfig, saveConfig } from "../../utils/armchair-config.js";
 import {
@@ -14,7 +15,11 @@ import {
   writeToProcess,
 } from "../../utils/processes.js";
 import { type AppInfo, discoverApps } from "../../utils/workspace.js";
-import { type WorktreeInfo, listWorktrees } from "../../utils/worktree.js";
+import {
+  type WorktreeInfo,
+  deleteWorktree,
+  listWorktrees,
+} from "../../utils/worktree.js";
 
 // ─── screen types ───────────────────────────────────────────────────────────
 
@@ -29,7 +34,10 @@ type ManagerScreen =
       selectedIndex: number;
       checked: Set<string>;
     }
-  | { type: "cards"; worktreePath: string; selectedCardIndex: number };
+  | { type: "cards"; worktreePath: string; selectedCardIndex: number; fullWidth: boolean }
+  | { type: "confirm-delete"; worktree: WorktreeInfo; worktrees: WorktreeInfo[]; selectedIndex: number }
+  | { type: "add-input"; value: string }
+  | { type: "add-run"; name: string };
 
 type Props = { onBack: () => void };
 
@@ -76,7 +84,7 @@ export function WorktreeManager({ onBack }: Props) {
         });
       }
 
-      setScreen({ type: "cards", worktreePath, selectedCardIndex: 0 });
+      setScreen({ type: "cards", worktreePath, selectedCardIndex: 0, fullWidth: false });
     },
     [],
   );
@@ -111,8 +119,8 @@ export function WorktreeManager({ onBack }: Props) {
 
   useInput(
     (input, key) => {
-      // q quits everywhere except cards (where it should go to the PTY)
-      if (input === "q" && screen.type !== "cards") {
+      // q quits everywhere except cards (PTY input) and add-input (text input)
+      if (input === "q" && screen.type !== "cards" && screen.type !== "add-input") {
         killAll();
         exit();
         return;
@@ -143,6 +151,72 @@ export function WorktreeManager({ onBack }: Props) {
         } else if (key.return) {
           const wt = screen.worktrees[screen.selectedIndex];
           if (wt) void handleWorktreeSelect(wt);
+        } else if (input === "d") {
+          const wt = screen.worktrees[screen.selectedIndex];
+          if (wt) {
+            setScreen({
+              type: "confirm-delete",
+              worktree: wt,
+              worktrees: screen.worktrees,
+              selectedIndex: screen.selectedIndex,
+            });
+          }
+        } else if (input === "a") {
+          setScreen({ type: "add-input", value: "" });
+        } else if (input === "c") {
+          const wt = screen.worktrees[screen.selectedIndex];
+          if (wt) {
+            void Promise.all([discoverApps(wt.path), loadConfig(wt.path)]).then(
+              ([apps, config]) => {
+                setScreen({
+                  type: "app-select",
+                  worktreePath: wt.path,
+                  apps,
+                  selectedIndex: 0,
+                  checked: new Set(config?.appDirs ?? []),
+                });
+              },
+            );
+          }
+        }
+      } else if (screen.type === "confirm-delete") {
+        if (key.escape || input === "n" || input === "N") {
+          setScreen({
+            type: "list",
+            worktrees: screen.worktrees,
+            selectedIndex: screen.selectedIndex,
+          });
+        } else if (input === "y" || input === "Y") {
+          const { worktree, worktrees, selectedIndex } = screen;
+          void deleteWorktree(worktree.path, worktree.branch).then(() => {
+            const updated = worktrees.filter((w) => w.path !== worktree.path);
+            setScreen({
+              type: "list",
+              worktrees: updated,
+              selectedIndex: Math.min(selectedIndex, Math.max(0, updated.length - 1)),
+            });
+          });
+        }
+      } else if (screen.type === "add-input") {
+        if (key.escape) {
+          listWorktrees()
+            .then((all) => {
+              const worktrees = all.filter((w) => !w.isBare);
+              setScreen({ type: "list", worktrees, selectedIndex: 0 });
+            })
+            .catch(() => onBack());
+        } else if (key.return) {
+          if (screen.value.trim()) {
+            setScreen({ type: "add-run", name: screen.value.trim() });
+          }
+        } else if (key.backspace || key.delete) {
+          setScreen((s) =>
+            s.type === "add-input" ? { ...s, value: s.value.slice(0, -1) } : s,
+          );
+        } else if (input && !key.ctrl && !key.meta) {
+          setScreen((s) =>
+            s.type === "add-input" ? { ...s, value: s.value + input } : s,
+          );
         }
       } else if (screen.type === "app-select") {
         if (key.escape) {
@@ -245,6 +319,11 @@ export function WorktreeManager({ onBack }: Props) {
           return;
         }
 
+        if (input === "f") {
+          setScreen((s) => s.type === "cards" ? { ...s, fullWidth: !s.fullWidth } : s);
+          return;
+        }
+
         // Forward everything else to the focused card's PTY
         const raw = keyToRaw(input, key);
         if (raw !== null) writeToProcess(focused.appDir, raw);
@@ -295,7 +374,7 @@ export function WorktreeManager({ onBack }: Props) {
             );
           })}
         </Box>
-        <Footer hints="↑↓ navigate  Enter start  Esc back  q quit" />
+        <Footer hints="↑↓ navigate  Enter start  a add  c config  d delete  Esc back  q quit" />
       </Box>
     );
   }
@@ -326,14 +405,132 @@ export function WorktreeManager({ onBack }: Props) {
     );
   }
 
+  if (screen.type === "add-run") {
+    return (
+      <WorktreeAdd
+        name={screen.name}
+        onDone={() => {
+          listWorktrees()
+            .then((all) => {
+              const worktrees = all.filter((w) => !w.isBare);
+              setScreen({ type: "list", worktrees, selectedIndex: 0 });
+            })
+            .catch(() => onBack());
+        }}
+      />
+    );
+  }
+
+  if (screen.type === "add-input") {
+    return (
+      <Box flexDirection="column" padding={1} gap={1}>
+        <Header sub="worktree add" />
+        <Box gap={1}>
+          <Text dimColor>Branch name:</Text>
+          <Text color="cyan">{screen.value}</Text>
+          <Text>_</Text>
+        </Box>
+        <Footer hints="Backspace edit  Enter create  Esc back" />
+      </Box>
+    );
+  }
+
+  if (screen.type === "confirm-delete") {
+    return (
+      <Box flexDirection="column" padding={1} gap={1}>
+        <Header />
+        <Box flexDirection="column" gap={1}>
+          <Text>
+            Delete worktree{" "}
+            <Text bold color="cyan">
+              {screen.worktree.branch}
+            </Text>
+            ?
+          </Text>
+          <Text dimColor>
+            This will remove the worktree directory and delete the branch from git.
+          </Text>
+          <Box gap={1}>
+            <Text color="red" bold>
+              [y]
+            </Text>
+            <Text>Yes, delete it</Text>
+            <Text dimColor>  </Text>
+            <Text color="green" bold>
+              [n]
+            </Text>
+            <Text>No, keep it</Text>
+          </Box>
+        </Box>
+        <Footer hints="y delete  n / Esc cancel" />
+      </Box>
+    );
+  }
+
   // cards screen
   const runningApps = getRunningAppsForWorktree(screen.worktreePath);
+  const focusedApp = runningApps[screen.selectedCardIndex];
 
   return (
     <Box flexDirection="column" padding={1} gap={1}>
       <Header sub={path.basename(screen.worktreePath)} />
       {runningApps.length === 0 ? (
         <Text dimColor>Starting apps…</Text>
+      ) : screen.fullWidth ? (
+        <>
+          {/* Tab bar */}
+          <Box flexDirection="row" gap={2}>
+            {runningApps.map(({ appDir, displayName }, i) => {
+              const focused = i === screen.selectedCardIndex;
+              const running = isRunning(appDir);
+              return (
+                <Box key={appDir} gap={1}>
+                  <Text bold={focused} color={focused ? "cyan" : "gray"}>
+                    {focused ? "▶" : " "} {displayName}
+                  </Text>
+                  <Text color={running ? "green" : "red"}>
+                    {running ? "●" : "✗"}
+                  </Text>
+                </Box>
+              );
+            })}
+          </Box>
+          {/* Focused card — full width */}
+          {focusedApp && (() => {
+            const { appDir, displayName } = focusedApp;
+            const allLines = appOutputs[appDir] ?? getOutput(appDir);
+            const running = isRunning(appDir);
+            const offset = scrollOffsets[appDir] ?? 0;
+            const end = Math.max(0, allLines.length - offset);
+            const start = Math.max(0, end - VISIBLE_LINES);
+            const visibleLines = allLines.slice(start, end);
+            const hasMore = start > 0;
+            return (
+              <Box
+                flexDirection="column"
+                borderStyle="single"
+                borderColor="cyan"
+                paddingX={1}
+              >
+                <Box gap={1}>
+                  <Text bold color="cyan">{displayName}</Text>
+                  <Text color={running ? "green" : "red"}>
+                    {running ? "●" : "✗"}
+                  </Text>
+                  {offset > 0 && <Text dimColor>↑ scrolled</Text>}
+                </Box>
+                {hasMore && <Text dimColor>  ↑ more above</Text>}
+                {visibleLines.length === 0 ? (
+                  <Text dimColor>waiting for output…</Text>
+                ) : (
+                  visibleLines.map((line, idx) => (
+                    <Text key={idx}>{line}</Text>
+                  ))
+                )}
+              </Box>
+            );
+          })()}
+        </>
       ) : (
         <Box flexDirection="row" gap={1}>
           {runningApps.map(({ appDir, displayName }, i) => {
@@ -362,18 +559,14 @@ export function WorktreeManager({ onBack }: Props) {
                   <Text color={running ? "green" : "red"}>
                     {running ? "●" : "✗"}
                   </Text>
-                  {offset > 0 && (
-                    <Text dimColor>↑ scrolled</Text>
-                  )}
+                  {offset > 0 && <Text dimColor>↑ scrolled</Text>}
                 </Box>
                 {hasMore && <Text dimColor>  ↑ more above</Text>}
                 {visibleLines.length === 0 ? (
                   <Text dimColor>waiting for output…</Text>
                 ) : (
                   visibleLines.map((line, idx) => (
-                    <Text key={idx} dimColor wrap="truncate">
-                      {line}
-                    </Text>
+                    <Text key={idx} wrap="truncate">{line}</Text>
                   ))
                 )}
               </Box>
@@ -381,12 +574,12 @@ export function WorktreeManager({ onBack }: Props) {
           })}
         </Box>
       )}
-      <Footer hints="←→ switch card  ↑↓ scroll  Esc back" />
+      <Footer hints={`←→ switch card  ↑↓ scroll  f ${screen.fullWidth ? "side-by-side" : "full-width"}  Esc back`} />
     </Box>
   );
 }
 
-const VISIBLE_LINES = 15;
+const VISIBLE_LINES = 40;
 
 // ─── key forwarding ──────────────────────────────────────────────────────────
 
