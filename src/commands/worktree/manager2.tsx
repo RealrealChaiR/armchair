@@ -1,6 +1,6 @@
 import * as path from "node:path";
-import { Box, Text, useApp, useInput, useStdin } from "ink";
-import { useCallback, useEffect, useState } from "react";
+import { Box, Text, useApp, useInput, useStdin, useStdout } from "ink";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { WorktreeAdd } from "./add.js";
 import { Footer } from "../../components/Footer.js";
@@ -14,6 +14,16 @@ import {
   start,
   writeToProcess,
 } from "../../utils/processes.js";
+import {
+  type ScreenState,
+  getSessionScreen,
+  isSessionRunning,
+  killAllSessions,
+  killSession,
+  startSession,
+  writeToSession,
+} from "../../utils/claude-sessions.js";
+import { type PRInfo, getPRForBranch, hyperlink } from "../../utils/github.js";
 import { type AppInfo, discoverApps } from "../../utils/workspace.js";
 import {
   type WorktreeInfo,
@@ -37,25 +47,45 @@ type ManagerScreen =
   | { type: "cards"; worktreePath: string; selectedCardIndex: number; fullWidth: boolean }
   | { type: "confirm-delete"; worktree: WorktreeInfo; worktrees: WorktreeInfo[]; selectedIndex: number }
   | { type: "add-input"; value: string }
-  | { type: "add-run"; name: string };
+  | { type: "add-run"; name: string }
+  | { type: "claude-session"; worktreePath: string; branch: string };
 
 type Props = { onBack: () => void };
 
 // ─── main component ──────────────────────────────────────────────────────────
 
+const CARD_WIDTH = 32;
+
 export function WorktreeManager({ onBack }: Props) {
   const { exit } = useApp();
   const { isRawModeSupported } = useStdin();
+  const { stdout } = useStdout();
   const [screen, setScreen] = useState<ManagerScreen>({ type: "loading" });
   const [appOutputs, setAppOutputs] = useState<Record<string, string[]>>({});
+  const [claudeScreens, setClaudeScreens] = useState<Record<string, ScreenState>>({});
+  const [prInfo, setPrInfo] = useState<Record<string, PRInfo | null>>({});
+  const [notifiedPaths, setNotifiedPaths] = useState<Set<string>>(new Set());
+  // Tracks which worktree path the user is currently viewing in the claude-session screen
+  const activeSessionPathRef = useRef<string | null>(null);
   // Lines from the bottom to offset the view (0 = newest, higher = older)
   const [scrollOffsets, setScrollOffsets] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    activeSessionPathRef.current =
+      screen.type === "claude-session" ? screen.worktreePath : null;
+  }, [screen]);
 
   useEffect(() => {
     listWorktrees()
       .then((all) => {
         const worktrees = all.filter((w) => !w.isBare);
         setScreen({ type: "list", worktrees, selectedIndex: 0 });
+        // Fetch PRs in parallel, updating state as each resolves
+        for (const wt of worktrees) {
+          void getPRForBranch(wt.branch, wt.path).then((pr) => {
+            setPrInfo((prev) => ({ ...prev, [wt.path]: pr }));
+          });
+        }
       })
       .catch((err) =>
         setScreen({ type: "error", message: String(err) }),
@@ -119,24 +149,44 @@ export function WorktreeManager({ onBack }: Props) {
 
   useInput(
     (input, key) => {
-      // q quits everywhere except cards (PTY input) and add-input (text input)
-      if (input === "q" && screen.type !== "cards" && screen.type !== "add-input") {
+      // q quits everywhere except cards (PTY input), add-input (text input), and claude-session
+      if (input === "q" && screen.type !== "cards" && screen.type !== "add-input" && screen.type !== "claude-session") {
         killAll();
+        killAllSessions();
         exit();
         return;
       }
 
       if (screen.type === "list") {
+        const cols = Math.max(1, Math.floor((stdout?.columns ?? 80) / (CARD_WIDTH + 1)));
         if (key.escape) {
           killAll();
           onBack();
         } else if (key.upArrow) {
           setScreen((s) =>
             s.type === "list"
-              ? { ...s, selectedIndex: Math.max(0, s.selectedIndex - 1) }
+              ? { ...s, selectedIndex: Math.max(0, s.selectedIndex - cols) }
               : s,
           );
         } else if (key.downArrow) {
+          setScreen((s) =>
+            s.type === "list"
+              ? {
+                  ...s,
+                  selectedIndex: Math.min(
+                    s.worktrees.length - 1,
+                    s.selectedIndex + cols,
+                  ),
+                }
+              : s,
+          );
+        } else if (key.leftArrow) {
+          setScreen((s) =>
+            s.type === "list"
+              ? { ...s, selectedIndex: Math.max(0, s.selectedIndex - 1) }
+              : s,
+          );
+        } else if (key.rightArrow) {
           setScreen((s) =>
             s.type === "list"
               ? {
@@ -149,6 +199,25 @@ export function WorktreeManager({ onBack }: Props) {
               : s,
           );
         } else if (key.return) {
+          const wt = screen.worktrees[screen.selectedIndex];
+          if (wt) {
+            const termCols = Math.max(40, (stdout?.columns ?? 80) - 8);
+            const termRows = Math.max(10, (stdout?.rows ?? 24) - 8);
+            // Seed from current screen buffer if session already running
+            setClaudeScreens((prev) => ({
+              ...prev,
+              [wt.path]: getSessionScreen(wt.path),
+            }));
+            startSession(wt.path, termCols, termRows, (newScreen) => {
+              if (newScreen.status === "waiting" && activeSessionPathRef.current !== wt.path) {
+                setNotifiedPaths((prev) => new Set([...prev, wt.path]));
+              }
+              setClaudeScreens((prev) => ({ ...prev, [wt.path]: newScreen }));
+            });
+            setNotifiedPaths((prev) => { const next = new Set(prev); next.delete(wt.path); return next; });
+            setScreen({ type: "claude-session", worktreePath: wt.path, branch: wt.branch });
+          }
+        } else if (input === "s") {
           const wt = screen.worktrees[screen.selectedIndex];
           if (wt) void handleWorktreeSelect(wt);
         } else if (input === "d") {
@@ -189,6 +258,7 @@ export function WorktreeManager({ onBack }: Props) {
         } else if (input === "y" || input === "Y") {
           const { worktree, worktrees, selectedIndex } = screen;
           void deleteWorktree(worktree.path, worktree.branch).then(() => {
+            killSession(worktree.path);
             const updated = worktrees.filter((w) => w.path !== worktree.path);
             setScreen({
               type: "list",
@@ -327,6 +397,19 @@ export function WorktreeManager({ onBack }: Props) {
         // Forward everything else to the focused card's PTY
         const raw = keyToRaw(input, key);
         if (raw !== null) writeToProcess(focused.appDir, raw);
+      } else if (screen.type === "claude-session") {
+        if (key.escape) {
+          listWorktrees()
+            .then((all) => {
+              const worktrees = all.filter((w) => !w.isBare);
+              setScreen({ type: "list", worktrees, selectedIndex: 0 });
+            })
+            .catch(() => onBack());
+          return;
+        }
+        // Forward all other keys to the Claude PTY
+        const raw = keyToRawFull(input, key);
+        if (raw !== null) writeToSession(screen.worktreePath, raw);
       }
     },
     { isActive: isRawModeSupported === true },
@@ -354,27 +437,71 @@ export function WorktreeManager({ onBack }: Props) {
   }
 
   if (screen.type === "list") {
+    const cols = Math.max(1, Math.floor((stdout?.columns ?? 80) / (CARD_WIDTH + 1)));
+    // Split worktrees into rows for grid layout
+    const rows: WorktreeInfo[][] = [];
+    for (let i = 0; i < screen.worktrees.length; i += cols) {
+      rows.push(screen.worktrees.slice(i, i + cols));
+    }
     return (
       <Box flexDirection="column" padding={1} gap={1}>
         <Header />
-        <Box flexDirection="column" gap={0}>
-          {screen.worktrees.map((wt, i) => {
-            const selected = i === screen.selectedIndex;
-            const running = getRunningAppsForWorktree(wt.path).length > 0;
-            return (
-              <Box key={wt.path} gap={2}>
-                <Text color={selected ? "green" : undefined} bold={selected}>
-                  {selected ? ">" : " "} {wt.branch}
-                </Text>
-                <Text dimColor>{path.basename(wt.path)}</Text>
-                <Text color={running ? "green" : "gray"}>
-                  {running ? "● running" : "○ stopped"}
-                </Text>
-              </Box>
-            );
-          })}
+        <Box flexDirection="column" gap={1}>
+          {rows.map((row, rowIdx) => (
+            <Box key={rowIdx} flexDirection="row" gap={1}>
+              {row.map((wt, colIdx) => {
+                const i = rowIdx * cols + colIdx;
+                const selected = i === screen.selectedIndex;
+                const running = getRunningAppsForWorktree(wt.path).length > 0;
+                const borderColor = selected ? "blue" : running ? "green" : "gray";
+                const hasSession = isSessionRunning(wt.path);
+                const isNotified = notifiedPaths.has(wt.path);
+                const sessionStatus = claudeScreens[wt.path]?.status ?? null;
+                const claudeStatus = !hasSession ? null
+                  : isNotified ? "notified"
+                  : sessionStatus === "waiting" ? "waiting"
+                  : "idle";
+                return (
+                  <Box
+                    key={wt.path}
+                    flexDirection="column"
+                    width={CARD_WIDTH}
+                    borderStyle="round"
+                    borderColor={borderColor}
+                    paddingX={1}
+                    gap={0}
+                  >
+                    <Box justifyContent="space-between">
+                      <Box flexShrink={1}>
+                        <Text bold={selected} wrap="truncate">{wt.branch}</Text>
+                      </Box>
+                      {prInfo[wt.path] && (
+                        <Box flexShrink={0} marginLeft={1}>
+                          <Text color="cyan">
+                            {hyperlink(prInfo[wt.path]!.url, `#${prInfo[wt.path]!.number}`)}
+                          </Text>
+                        </Box>
+                      )}
+                    </Box>
+                    {running && (
+                      <Text color="green">● Running</Text>
+                    )}
+                    {claudeStatus === "idle" && (
+                      <Text color="green" dimColor>○ Ready</Text>
+                    )}
+                    {claudeStatus === "waiting" && (
+                      <Text color="yellow">🔔 Awaiting Input</Text>
+                    )}
+                    {claudeStatus === "notified" && (
+                      <Text color="red" bold>● View Updates</Text>
+                    )}
+                  </Box>
+                );
+              })}
+            </Box>
+          ))}
         </Box>
-        <Footer hints="↑↓ navigate  Enter start  a add  c config  d delete  Esc back  q quit" />
+        <Footer hints="↑↓←→ navigate  Enter claude  s start apps  a add  c config  d delete  Esc back  q quit" />
       </Box>
     );
   }
@@ -463,6 +590,50 @@ export function WorktreeManager({ onBack }: Props) {
           </Box>
         </Box>
         <Footer hints="y delete  n / Esc cancel" />
+      </Box>
+    );
+  }
+
+  if (screen.type === "claude-session") {
+    const { rows: sessionRows, cursorRow, cursorCol } =
+      claudeScreens[screen.worktreePath] ?? getSessionScreen(screen.worktreePath);
+    const sessionRunning = isSessionRunning(screen.worktreePath);
+    return (
+      <Box flexDirection="column" padding={1} gap={1}>
+        <Header sub={`claude @ ${screen.branch}`} />
+        <Box
+          flexDirection="column"
+          borderStyle="single"
+          borderColor={sessionRunning ? "green" : "gray"}
+          paddingX={1}
+        >
+          <Box gap={1}>
+            <Text bold color="cyan">claude</Text>
+            <Text color={sessionRunning ? "green" : "red"}>
+              {sessionRunning ? "● running" : "✗ stopped"}
+            </Text>
+          </Box>
+          {sessionRows.length === 0 ? (
+            <Text dimColor>Starting Claude…</Text>
+          ) : (
+            sessionRows.map((line, rowIdx) => {
+              if (rowIdx !== cursorRow) {
+                return <Text key={rowIdx}>{line}</Text>;
+              }
+              const before = line.slice(0, cursorCol);
+              const cursorChar = line[cursorCol] ?? " ";
+              const after = line.slice(cursorCol + 1);
+              return (
+                <Text key={rowIdx}>
+                  {before}
+                  <Text inverse>{cursorChar}</Text>
+                  {after}
+                </Text>
+              );
+            })
+          )}
+        </Box>
+        <Footer hints="Esc back to grid" />
       </Box>
     );
   }
@@ -580,10 +751,13 @@ export function WorktreeManager({ onBack }: Props) {
 }
 
 const VISIBLE_LINES = 40;
+const CLAUDE_VISIBLE_LINES = 50;
 
 // ─── key forwarding ──────────────────────────────────────────────────────────
 
-function keyToRaw(input: string, key: Parameters<Parameters<typeof useInput>[0]>[1]): string | null {
+type InkKey = Parameters<Parameters<typeof useInput>[0]>[1];
+
+function keyToRaw(input: string, key: InkKey): string | null {
   // up/down are used for scrolling, not forwarded to PTY
   if (key.return) return "\r";
   if (key.backspace) return "\x7f";
@@ -595,6 +769,15 @@ function keyToRaw(input: string, key: Parameters<Parameters<typeof useInput>[0]>
   if (key.ctrl && input) return String.fromCharCode(input.charCodeAt(0) - 96);
   if (input) return input;
   return null;
+}
+
+// Full forwarding for Claude session — includes arrow keys
+function keyToRawFull(input: string, key: InkKey): string | null {
+  if (key.upArrow) return "\x1b[A";
+  if (key.downArrow) return "\x1b[B";
+  if (key.rightArrow) return "\x1b[C";
+  if (key.leftArrow) return "\x1b[D";
+  return keyToRaw(input, key);
 }
 
 // ─── shared sub-components ───────────────────────────────────────────────────
