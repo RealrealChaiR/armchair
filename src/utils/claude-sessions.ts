@@ -4,20 +4,30 @@ import pkg from "@xterm/headless";
 const { Terminal } = pkg;
 
 export type SessionStatus = "waiting" | "active";
-export type ScreenState = { rows: string[]; cursorRow: number; cursorCol: number; status: SessionStatus };
+export type ScreenState = {
+  rows: string[];
+  cursorRow: number;
+  cursorCol: number;
+  status: SessionStatus;
+  notified: boolean;
+};
+
+type Subscriber = (s: ScreenState) => void;
 
 type Entry = {
   proc: IPty;
   term: typeof Terminal.prototype;
-  onScreen: (s: ScreenState) => void;
+  subscribers: Set<Subscriber>;
   passthroughWriter: ((d: string) => void) | null;
   lastStatus: SessionStatus;
+  notified: boolean;
 };
 
 const sessions = new Map<string, Entry>();
 let exitHandlerRegistered = false;
 
-function readScreen(term: typeof Terminal.prototype): ScreenState {
+function snapshot(entry: Entry): ScreenState {
+  const term = entry.term;
   const rows: string[] = [];
   for (let i = 0; i < term.rows; i++) {
     rows.push(term.buffer.active.getLine(i)?.translateToString(false) ?? "");
@@ -28,21 +38,22 @@ function readScreen(term: typeof Terminal.prototype): ScreenState {
   while (last > cursorRow && rows[last]?.trim() === "") last--;
   const cursorLine = rows[cursorRow] ?? "";
   const status: SessionStatus = cursorLine.trimStart().startsWith("❯") ? "waiting" : "active";
-  return { rows: rows.slice(0, last + 1), cursorRow, cursorCol, status };
+  return {
+    rows: rows.slice(0, last + 1),
+    cursorRow,
+    cursorCol,
+    status,
+    notified: entry.notified,
+  };
 }
 
-export function startSession(
-  worktreePath: string,
-  cols: number,
-  rows: number,
-  onScreen: (screen: ScreenState) => void,
-): void {
-  const existing = sessions.get(worktreePath);
-  if (existing) {
-    // Update callback so re-mounted Ink components get live updates
-    existing.onScreen = onScreen;
-    return;
-  }
+function emit(entry: Entry): void {
+  const state = snapshot(entry);
+  for (const sub of entry.subscribers) sub(state);
+}
+
+export function startSession(worktreePath: string, cols: number, rows: number): void {
+  if (sessions.has(worktreePath)) return;
 
   if (!exitHandlerRegistered) {
     process.on("exit", killAllSessions);
@@ -59,15 +70,31 @@ export function startSession(
     env: process.env as Record<string, string>,
   });
 
-  const entry: Entry = { proc, term, onScreen, passthroughWriter: null, lastStatus: "active" };
+  const entry: Entry = {
+    proc,
+    term,
+    subscribers: new Set(),
+    passthroughWriter: null,
+    lastStatus: "active",
+    notified: false,
+  };
   sessions.set(worktreePath, entry);
 
   proc.onData((data) => {
     term.write(data, () => {
-      const screen = readScreen(entry.term);
-      entry.lastStatus = screen.status;
+      const state = snapshot(entry);
+      // Flag "you have unread output" when claude finishes a turn while
+      // the user isn't actively viewing this session via passthrough.
+      if (
+        state.status === "waiting" &&
+        entry.lastStatus !== "waiting" &&
+        !entry.passthroughWriter
+      ) {
+        entry.notified = true;
+      }
+      entry.lastStatus = state.status;
       entry.passthroughWriter?.(data);
-      entry.onScreen(screen);
+      emit(entry);
     });
   });
 
@@ -75,6 +102,27 @@ export function startSession(
     term.dispose();
     sessions.delete(worktreePath);
   });
+}
+
+export function subscribeToSession(worktreePath: string, cb: Subscriber): () => void {
+  const entry = sessions.get(worktreePath);
+  if (!entry) return () => {};
+  entry.subscribers.add(cb);
+  cb(snapshot(entry));
+  return () => {
+    entry.subscribers.delete(cb);
+  };
+}
+
+export function acknowledgeSession(worktreePath: string): void {
+  const entry = sessions.get(worktreePath);
+  if (!entry || !entry.notified) return;
+  entry.notified = false;
+  emit(entry);
+}
+
+export function getRunningSessionPaths(): string[] {
+  return [...sessions.keys()];
 }
 
 export function setPassthroughWriter(
@@ -99,8 +147,8 @@ export function onSessionExit(worktreePath: string, cb: () => void): () => void 
 export function getSessionScreen(worktreePath: string): ScreenState {
   const entry = sessions.get(worktreePath);
   return entry
-    ? readScreen(entry.term)
-    : { rows: [], cursorRow: 0, cursorCol: 0, status: "active" };
+    ? snapshot(entry)
+    : { rows: [], cursorRow: 0, cursorCol: 0, status: "active", notified: false };
 }
 
 export function getSessionStatus(worktreePath: string): SessionStatus {

@@ -7,7 +7,7 @@ import type { AppInfo } from "../../utils/workspace.js";
 import type { WorktreeInfo } from "../../utils/worktree.js";
 import type { ReviewStatus } from "./ready-for-review.js";
 import { Box, Text, useApp, useInput, useStdin, useStdout } from "ink";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Footer } from "../../components/Footer.js";
 import {
@@ -16,10 +16,13 @@ import {
 } from "../../utils/armchair-config.js";
 import { killAllChildren } from "../../utils/child-registry.js";
 import {
+  acknowledgeSession,
+  getRunningSessionPaths,
   isSessionRunning,
   killAllSessions,
   killSession,
   startSession,
+  subscribeToSession,
 } from "../../utils/claude-sessions.js";
 import { run } from "../../utils/exec.js";
 import { getCIStatus, getPRForBranch, hyperlink } from "../../utils/github.js";
@@ -106,11 +109,28 @@ export function WorktreeManager({ onBack }: Props) {
     Record<string, ReviewStatus | null>
   >({});
   const [reviewHeads, setReviewHeads] = useState<Record<string, string>>({});
-  const [notifiedPaths, setNotifiedPaths] = useState<Set<string>>(new Set());
   const [globalConfig, setGlobalConfig] = useState<GlobalConfig>({});
   const [scrollOffsets, setScrollOffsets] = useState<Record<string, number>>(
     {},
   );
+  const subscribersRef = useRef<Map<string, () => void>>(new Map());
+
+  const subscribeIfNeeded = useCallback((path: string) => {
+    if (subscribersRef.current.has(path)) return;
+    const unsub = subscribeToSession(path, (state) => {
+      setClaudeScreens((prev) => ({ ...prev, [path]: state }));
+    });
+    subscribersRef.current.set(path, unsub);
+  }, []);
+
+  useEffect(() => {
+    const subs = subscribersRef.current;
+    for (const path of getRunningSessionPaths()) subscribeIfNeeded(path);
+    return () => {
+      for (const unsub of subs.values()) unsub();
+      subs.clear();
+    };
+  }, [subscribeIfNeeded]);
 
   useEffect(() => {
     listWorktrees()
@@ -281,18 +301,9 @@ export function WorktreeManager({ onBack }: Props) {
                 wt.path,
                 process.stdout.columns ?? 80,
                 process.stdout.rows ?? 24,
-                (newScreen) => {
-                  setClaudeScreens((prev) => ({ ...prev, [wt.path]: newScreen }));
-                  if (newScreen.status === "waiting") {
-                    setNotifiedPaths((prev) => new Set([...prev, wt.path]));
-                  }
-                },
               );
-              setNotifiedPaths((prev) => {
-                const next = new Set(prev);
-                next.delete(wt.path);
-                return next;
-              });
+              subscribeIfNeeded(wt.path);
+              acknowledgeSession(wt.path);
               requestSession(
                 wt.path,
                 `Analyse all changes on this branch. Run \`git diff --stat ${ref}\` for committed changes, \`git diff --staged\` for staged changes, and \`git diff\` for unstaged changes. Then give me a concise summary of what has changed.`,
@@ -708,13 +719,12 @@ export function WorktreeManager({ onBack }: Props) {
                       ? "green"
                       : "gray";
                   const hasSession = isSessionRunning(wt.path);
-                  const isNotified = notifiedPaths.has(wt.path);
-                  const sessionStatus = claudeScreens[wt.path]?.status ?? null;
+                  const sessionState = claudeScreens[wt.path];
                   const claudeStatus = !hasSession
                     ? null
-                    : isNotified
+                    : sessionState?.notified
                       ? "notified"
-                      : sessionStatus === "waiting"
+                      : sessionState?.status === "waiting"
                         ? "waiting"
                         : "idle";
                   const revStatus = reviewStatus[wt.path] ?? null;
@@ -1083,9 +1093,18 @@ export function WorktreeManager({ onBack }: Props) {
                 .catch(() => {});
             }
           }}
+          onPRChange={() => {
+            const wt = activeReview;
+            void getPRForBranch(wt.branch, wt.path).then((pr) => {
+              setPrInfo((prev) => ({ ...prev, [wt.path]: pr }));
+            });
+          }}
           onDone={() => {
             const wt = activeReview;
             setActiveReview(null);
+            void getPRForBranch(wt.branch, wt.path).then((pr) => {
+              setPrInfo((prev) => ({ ...prev, [wt.path]: pr }));
+            });
             void getCIStatus(wt.branch, wt.path).then((ci) => {
               setCiStatus((prev) => ({ ...prev, [wt.path]: ci }));
             });

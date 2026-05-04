@@ -63,6 +63,7 @@ type Props = {
   isVisible: boolean;
   onDone: () => void;
   onStatusChange: (status: ReviewStatus | null) => void;
+  onPRChange?: () => void;
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -86,8 +87,6 @@ function stepColor(
   return "gray";
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 async function writeTmp(content: string): Promise<string> {
   const dir = path.join(os.homedir(), ".cache", "armchair");
   await mkdir(dir, { recursive: true });
@@ -106,7 +105,6 @@ const INITIAL_STEPS: StepState[] = [
   { label: "Run linters", status: "pending" },
   { label: "Commit & push", status: "pending" },
   { label: "Open / update PR", status: "pending" },
-  { label: "Monitor CI", status: "pending" },
 ];
 
 export function ReadyForReview({
@@ -114,6 +112,7 @@ export function ReadyForReview({
   isVisible,
   onDone,
   onStatusChange,
+  onPRChange,
 }: Props) {
   const { isRawModeSupported } = useStdin();
   const [steps, setSteps] = useState<StepState[]>(INITIAL_STEPS);
@@ -127,6 +126,8 @@ export function ReadyForReview({
   // Keep a stable ref so the status-change effect doesn't depend on the callback identity
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
+  const onPRChangeRef = useRef(onPRChange);
+  onPRChangeRef.current = onPRChange;
 
   // Report review status to the parent grid whenever it changes
   useEffect(() => {
@@ -295,7 +296,6 @@ export function ReadyForReview({
     executing.current = true;
 
     const cwd = worktree.path;
-    const branch = worktree.branch;
 
     // ── step 0: rebase ──────────────────────────────────────────────────────
     updateStep(0, { status: "running" });
@@ -726,21 +726,34 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
       return;
     }
 
-    // ── step 5: commit + push ───────────────────────────────────────────────
+    // ── step 5: squash + commit + push ──────────────────────────────────────
     updateStep(5, { status: "running" });
     try {
+      const remote = (await getPrimaryRemote(cwd)) ?? "origin";
       await run("git add -A", { cwd });
-      const { stdout: diff } = await run("git diff --cached", { cwd });
 
-      if (!diff.trim()) {
+      // Full branch diff vs main: committed branch work + the wip checkpoint
+      // + any AI-driven fixes from earlier review steps + any still-uncommitted
+      // tree changes. Squashing everything into one commit gives Claude the
+      // complete intent for the message and produces a clean PR history.
+      const { stdout: branchDiff } = await run(`git diff ${remote}/main`, {
+        cwd,
+      });
+
+      if (!branchDiff.trim()) {
         updateStep(5, { label: "Nothing to commit", status: "skipped" });
       } else {
-        updateStep(5, { label: "Writing commit message…", status: "running" });
+        updateStep(5, {
+          label: "Writing squashed commit message…",
+          status: "running",
+        });
         const msg = await claudeRun(
-          `Write a git commit message for these staged changes. Follow conventional commits format if appropriate. Return ONLY the commit message — subject line, blank line, then body if needed. Nothing else.\n\n${diff}`,
+          `Write a git commit message describing the full set of changes on this branch. Follow conventional commits format if appropriate. Return ONLY the commit message — subject line, blank line, then body if needed. Nothing else.\n\n${branchDiff}`,
           cwd,
         );
 
+        // Reset to main keeping everything staged, then commit as one.
+        await run(`git reset --soft ${remote}/main`, { cwd });
         const msgFile = await writeTmp(msg);
         try {
           await run(`git commit -F ${msgFile}`, { cwd });
@@ -749,10 +762,12 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
         }
 
         updateStep(5, { label: "Pushing to origin…", status: "running" });
-        await runLines("git push origin HEAD", { cwd }, (l) =>
-          appendOutput(5, l),
+        await runLines(
+          `git push --force-with-lease ${remote} HEAD`,
+          { cwd },
+          (l) => appendOutput(5, l),
         );
-        updateStep(5, { label: "Committed & pushed", status: "done" });
+        updateStep(5, { label: "Squashed & pushed", status: "done" });
       }
     } catch (err) {
       updateStep(5, { status: "error", detail: String(err) });
@@ -782,8 +797,10 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
         });
         prUrl = stdout.trim().split("\n").pop() ?? "";
         updateStep(6, { label: `PR opened — ${prUrl}`, status: "done" });
+        onPRChangeRef.current?.();
       } else {
         prUrl = existingPr.url;
+        onPRChangeRef.current?.();
         updateStep(6, {
           label: "Reviewing PR description…",
           status: "running",
@@ -809,111 +826,6 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
       }
     } catch (err) {
       updateStep(6, { status: "error", detail: String(err) });
-      setPhase({ type: "error", message: String(err) });
-      return;
-    }
-
-    // ── step 7: monitor CI ──────────────────────────────────────────────────
-    updateStep(7, { status: "running" });
-    try {
-      type RunEntry = {
-        databaseId: number;
-        status: string;
-        conclusion: string;
-        headBranch: string;
-      };
-
-      const findRun = async (): Promise<RunEntry | null> => {
-        for (let i = 0; i < 12; i++) {
-          const { stdout } = await run(
-            `gh run list --limit 10 --json databaseId,status,conclusion,headBranch`,
-            { cwd },
-          );
-          const runs = (JSON.parse(stdout) as RunEntry[]).filter(
-            (r) => r.headBranch === branch,
-          );
-          if (runs.length > 0) return runs[0] ?? null;
-          await sleep(5000);
-        }
-        return null;
-      };
-
-      const pollRun = async (id: number): Promise<RunEntry> => {
-        for (let i = 0; i < 60; i++) {
-          const { stdout } = await run(
-            `gh run view ${id} --json status,conclusion,databaseId`,
-            { cwd },
-          );
-          const entry = JSON.parse(stdout) as RunEntry;
-          updateStep(7, { label: `CI: ${entry.status}…`, status: "running" });
-          if (entry.status === "completed") return entry;
-          await sleep(15000);
-        }
-        throw new Error("CI timed out after 15 minutes");
-      };
-
-      let ciRun = await findRun();
-      if (!ciRun) {
-        updateStep(7, {
-          label: "No CI run found — skipping",
-          status: "skipped",
-        });
-      } else {
-        let ciPassed = false;
-        for (let attempt = 0; attempt < 3 && !ciPassed; attempt++) {
-          const result = await pollRun(ciRun.databaseId);
-          if (result.conclusion === "success") {
-            ciPassed = true;
-          } else if (attempt < 2) {
-            updateStep(7, {
-              label: `CI failed — fetching logs (attempt ${attempt + 1}/3)`,
-              status: "running",
-            });
-            const { stdout: logs } = await run(
-              `gh run view ${ciRun.databaseId} --log-failed`,
-              { cwd },
-            );
-            await claudeRun(
-              `The CI pipeline failed. Fix the issue, then commit and push.\n\nFailure logs:\n${logs}`,
-              cwd,
-              (l) => appendOutput(7, l),
-            );
-            await run("git add -A", { cwd });
-            const { stdout: fixDiff } = await run("git diff --cached", { cwd });
-            if (fixDiff.trim()) {
-              const fixMsg = await claudeRun(
-                `Write a one-line git commit message for this CI fix. Return ONLY the message.\n\n${fixDiff}`,
-                cwd,
-              );
-              const fixFile = await writeTmp(fixMsg);
-              try {
-                await run(`git commit -F ${fixFile}`, { cwd });
-              } finally {
-                await unlink(fixFile).catch(() => {});
-              }
-              await run("git push origin HEAD", { cwd });
-              await sleep(5000);
-              ciRun = (await findRun()) ?? ciRun;
-            }
-          } else {
-            throw new Error(`CI failed after 3 fix attempts`);
-          }
-        }
-
-        updateStep(7, {
-          label: ciPassed ? `CI passed — ${prUrl}` : "CI failed",
-          status: ciPassed ? "done" : "error",
-        });
-        if (!ciPassed) {
-          setPhase({
-            type: "error",
-            message: "CI did not pass after 3 attempts",
-          });
-          return;
-        }
-      }
-    } catch (err) {
-      updateStep(7, { status: "error", detail: String(err) });
       setPhase({ type: "error", message: String(err) });
       return;
     }
