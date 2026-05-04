@@ -2,37 +2,41 @@
 
 Terminal-based dev tools written in TypeScript using [Ink](https://github.com/vadimdemedes/ink).
 
-## Getting Started
+## Installation
+
+Requires [pnpm](https://pnpm.io/installation), Node.js, and standard C++ build tools (for `node-pty`).
+
+```bash
+pnpm add -g github:RealChaiR/armchair
+```
+
+## Upgrading
+
+```bash
+pnpm add -g github:RealChaiR/armchair
+```
+
+Same command — pnpm will fetch the latest commit and rebuild.
+
+## Development
 
 ```bash
 pnpm install
 pnpm dev
 ```
 
-## Available Scripts
+### Scripts
 
-- `pnpm dev` - Run the CLI in development mode (with hot reload)
-- `pnpm build` - Build the CLI to JavaScript
-- `pnpm lint` - Check code with ESLint
-- `pnpm lint:fix` - Fix lint errors
-- `pnpm format` - Format code with Prettier
-- `pnpm format:check` - Check code formatting
-- `pnpm typecheck` - Check TypeScript types
-
-## Project Structure
-
-```
-src/
-├── index.tsx      # Entry point
-├── app.tsx        # Root component
-└── ...            # Feature components
-```
+- `pnpm dev` - Run in development mode
+- `pnpm build` - Build to `dist/`
+- `pnpm lint` / `pnpm lint:fix` - ESLint
+- `pnpm format` / `pnpm format:check` - Prettier
+- `pnpm typecheck` - TypeScript type check
 
 ## Tech Stack
 
-- **Ink** - React renderer for CLI
-- **React** - UI framework
-- **TypeScript** - Type safety
-- **Babel** - JSX transpilation
-- **ESLint** - Code linting
-- **Prettier** - Code formatting
+- **Ink** — React renderer for terminals
+- **React** — UI framework
+- **TypeScript** — Type safety
+- **node-pty** — PTY process management
+- **tsup** — Bundler
