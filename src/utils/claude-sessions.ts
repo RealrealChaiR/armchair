@@ -3,26 +3,29 @@ import type { IPty } from "node-pty";
 import pkg from "@xterm/headless";
 const { Terminal } = pkg;
 
-type Entry = { proc: IPty; term: Terminal };
-
 export type SessionStatus = "waiting" | "active";
 export type ScreenState = { rows: string[]; cursorRow: number; cursorCol: number; status: SessionStatus };
+
+type Entry = {
+  proc: IPty;
+  term: typeof Terminal.prototype;
+  onScreen: (s: ScreenState) => void;
+  passthroughWriter: ((d: string) => void) | null;
+  lastStatus: SessionStatus;
+};
 
 const sessions = new Map<string, Entry>();
 let exitHandlerRegistered = false;
 
-function readScreen(term: Terminal): ScreenState {
+function readScreen(term: typeof Terminal.prototype): ScreenState {
   const rows: string[] = [];
   for (let i = 0; i < term.rows; i++) {
-    // Don't trim — cursor position may be past visible characters
     rows.push(term.buffer.active.getLine(i)?.translateToString(false) ?? "");
   }
-  // Drop trailing blank rows (but keep up to cursor row)
   const cursorRow = term.buffer.active.cursorY;
   const cursorCol = term.buffer.active.cursorX;
   let last = rows.length - 1;
   while (last > cursorRow && rows[last]?.trim() === "") last--;
-  // Claude shows ❯ at the start of the input line when waiting for user input
   const cursorLine = rows[cursorRow] ?? "";
   const status: SessionStatus = cursorLine.trimStart().startsWith("❯") ? "waiting" : "active";
   return { rows: rows.slice(0, last + 1), cursorRow, cursorCol, status };
@@ -34,7 +37,12 @@ export function startSession(
   rows: number,
   onScreen: (screen: ScreenState) => void,
 ): void {
-  if (sessions.has(worktreePath)) return;
+  const existing = sessions.get(worktreePath);
+  if (existing) {
+    // Update callback so re-mounted Ink components get live updates
+    existing.onScreen = onScreen;
+    return;
+  }
 
   if (!exitHandlerRegistered) {
     process.on("exit", killAllSessions);
@@ -51,10 +59,16 @@ export function startSession(
     env: process.env as Record<string, string>,
   });
 
-  sessions.set(worktreePath, { proc, term });
+  const entry: Entry = { proc, term, onScreen, passthroughWriter: null, lastStatus: "active" };
+  sessions.set(worktreePath, entry);
 
   proc.onData((data) => {
-    term.write(data, () => onScreen(readScreen(term)));
+    term.write(data, () => {
+      const screen = readScreen(entry.term);
+      entry.lastStatus = screen.status;
+      entry.passthroughWriter?.(data);
+      entry.onScreen(screen);
+    });
   });
 
   proc.onExit(() => {
@@ -63,9 +77,34 @@ export function startSession(
   });
 }
 
+export function setPassthroughWriter(
+  worktreePath: string,
+  writer: ((d: string) => void) | null,
+): void {
+  const entry = sessions.get(worktreePath);
+  if (entry) entry.passthroughWriter = writer;
+}
+
+export function resizeSession(worktreePath: string, cols: number, rows: number): void {
+  sessions.get(worktreePath)?.proc.resize(cols, rows);
+}
+
+export function onSessionExit(worktreePath: string, cb: () => void): () => void {
+  const entry = sessions.get(worktreePath);
+  if (!entry) { cb(); return () => {}; }
+  const d = entry.proc.onExit(cb);
+  return () => d.dispose();
+}
+
 export function getSessionScreen(worktreePath: string): ScreenState {
   const entry = sessions.get(worktreePath);
-  return entry ? readScreen(entry.term) : { rows: [], cursorRow: 0, cursorCol: 0 };
+  return entry
+    ? readScreen(entry.term)
+    : { rows: [], cursorRow: 0, cursorCol: 0, status: "active" };
+}
+
+export function getSessionStatus(worktreePath: string): SessionStatus {
+  return sessions.get(worktreePath)?.lastStatus ?? "active";
 }
 
 export function isSessionRunning(worktreePath: string): boolean {
