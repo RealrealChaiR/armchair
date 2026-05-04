@@ -137,7 +137,7 @@ export function WorktreeManager({ onBack }: Props) {
                       : prev,
                   );
                 }
-                return rh;
+                return { ...rh, [wt.path]: head };
               });
             })
             .catch(() => {});
@@ -342,6 +342,7 @@ export function WorktreeManager({ onBack }: Props) {
             void (async () => {
               const cwd = wt.path;
               const remote = (await getPrimaryRemote(cwd)) ?? "origin";
+              await run(`git fetch ${remote}`, { cwd });
               const [
                 { stdout: branchDiff },
                 { stdout: staged },

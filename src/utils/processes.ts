@@ -1,15 +1,12 @@
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
+import { stripAnsi } from "./exec.js";
 
 type Entry = { proc: IPty; output: string[]; displayName: string };
 
 const processes = new Map<string, Entry>();
 let exitHandlerRegistered = false;
 
-// Strip ANSI escape sequences so raw PTY output renders cleanly in Ink.
-function stripAnsi(str: string): string {
-  return str.replace(/\x1B\[[0-9;]*[mGKHFJA-Za-z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "");
-}
 
 export function start(
   appDir: string,

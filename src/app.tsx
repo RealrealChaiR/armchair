@@ -1,7 +1,7 @@
 import { Box, Text, useInput, useStdin } from "ink";
 import { useState } from "react";
 
-import { WorktreeManager } from "./commands/worktree/manager2.js";
+import { WorktreeManager } from "./commands/worktree/manager.js";
 import { Footer } from "./components/Footer.js";
 import { useQuit } from "./hooks/useQuit.js";
 
@@ -14,9 +14,11 @@ const COMMANDS = [
 
 type AppScreen = { type: "menu"; index: number } | { type: "worktree-manager" };
 
-export function App() {
+export function App({ startAtManager = false }: { startAtManager?: boolean }) {
   const { isRawModeSupported } = useStdin();
-  const [screen, setScreen] = useState<AppScreen>({ type: "menu", index: 0 });
+  const [screen, setScreen] = useState<AppScreen>(
+    startAtManager ? { type: "worktree-manager" } : { type: "menu", index: 0 },
+  );
 
   useQuit();
 
