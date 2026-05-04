@@ -36,10 +36,15 @@ function snapshot(entry: Entry): ScreenState {
   const cursorCol = term.buffer.active.cursorX;
   let last = rows.length - 1;
   while (last > cursorRow && rows[last]?.trim() === "") last--;
-  const cursorLine = rows[cursorRow] ?? "";
-  const status: SessionStatus = cursorLine.trimStart().startsWith("❯") ? "waiting" : "active";
+  // Claude's spinner line ("✶ Crafting… (… esc to interrupt)") is only
+  // present while a turn is in flight. Its absence means we're back at
+  // the input prompt. Looking for the prompt glyph itself is fragile —
+  // recent Claude versions use ">" inside a bordered box rather than "❯".
+  const visible = rows.slice(0, last + 1);
+  const isBusy = visible.some((line) => line.includes("esc to interrupt"));
+  const status: SessionStatus = isBusy ? "active" : "waiting";
   return {
-    rows: rows.slice(0, last + 1),
+    rows: visible,
     cursorRow,
     cursorCol,
     status,

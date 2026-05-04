@@ -847,11 +847,15 @@ ${branchDiff}`,
 
       if (!existingPr) {
         updateStep(6, { label: "Creating PR…", status: "running" });
-        const { stdout } = await run(`gh pr create --base main --fill`, {
-          cwd,
-        });
+        const { stdout } = await run(
+          `gh pr create --base main --fill --draft`,
+          { cwd },
+        );
         prUrl = stdout.trim().split("\n").pop() ?? "";
-        updateStep(6, { label: `PR opened — ${prUrl}`, status: "done" });
+        updateStep(6, {
+          label: `Draft PR opened — ${prUrl}`,
+          status: "done",
+        });
         onPRChangeRef.current?.();
       } else {
         prUrl = existingPr.url;
