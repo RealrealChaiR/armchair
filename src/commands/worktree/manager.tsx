@@ -726,7 +726,7 @@ export function WorktreeManager({ onBack }: Props) {
                       ? "notified"
                       : sessionState?.status === "waiting"
                         ? "waiting"
-                        : "idle";
+                        : "thinking";
                   const revStatus = reviewStatus[wt.path] ?? null;
                   return (
                     <Box
@@ -770,10 +770,8 @@ export function WorktreeManager({ onBack }: Props) {
                           })()}
                       </Box>
                       {running && <Text color="green">● Running</Text>}
-                      {claudeStatus === "idle" && (
-                        <Text color="green" dimColor>
-                          ○ Ready
-                        </Text>
+                      {claudeStatus === "thinking" && (
+                        <Text color="cyan">◌ Thinking ...</Text>
                       )}
                       {claudeStatus === "waiting" && (
                         <Text color="yellow">🔔 Awaiting Input</Text>

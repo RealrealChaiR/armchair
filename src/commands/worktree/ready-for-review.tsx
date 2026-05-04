@@ -2,7 +2,7 @@ import { mkdir, unlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { WorktreeInfo } from "../../utils/worktree.js";
-import { Box, Text, useInput, useStdin } from "ink";
+import { Box, Text, useInput, useStdin, useStdout } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Footer } from "../../components/Footer.js";
@@ -95,6 +95,23 @@ async function writeTmp(content: string): Promise<string> {
   return file;
 }
 
+// Strip wrapping code fences and surrounding whitespace from an LLM response
+// so the commit subject doesn't end up as "```".
+function sanitizeCommitMessage(raw: string): string {
+  let msg = raw.replace(/\r\n/g, "\n").trim();
+  // Remove a single fenced block wrapping the entire message
+  // (```optional-lang\n…\n```)
+  const fenceMatch = msg.match(/^```[^\n]*\n([\s\S]*?)\n```$/);
+  if (fenceMatch) msg = fenceMatch[1]!.trim();
+  // Defensively strip any stray fence lines that remain
+  msg = msg
+    .split("\n")
+    .filter((line) => !/^\s*```[a-zA-Z0-9_-]*\s*$/.test(line))
+    .join("\n")
+    .trim();
+  return msg;
+}
+
 // ─── component ───────────────────────────────────────────────────────────────
 
 const INITIAL_STEPS: StepState[] = [
@@ -115,9 +132,11 @@ export function ReadyForReview({
   onPRChange,
 }: Props) {
   const { isRawModeSupported } = useStdin();
+  const { stdout } = useStdout();
   const [steps, setSteps] = useState<StepState[]>(INITIAL_STEPS);
   const [phase, setPhase] = useState<Phase>({ type: "running" });
   const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
+  const [multiselectScrollOffset, setMultiselectScrollOffset] = useState(0);
   const resolveInputRef = useRef<((key: string) => void) | null>(null);
   const resolveMultiselectRef = useRef<((ids: number[]) => void) | null>(null);
   const resolveTextInputRef = useRef<((value: string) => void) | null>(null);
@@ -143,6 +162,23 @@ export function ReadyForReview({
     // onStatusChangeRef is a ref — intentionally omitted from deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase.type, pendingInput?.type]);
+
+  // Keep the multiselect cursor within the visible scroll window
+  const termRows = stdout?.rows ?? 24;
+  // Each item is budgeted 3 rows (description usually wraps + file/line line)
+  const maxVisibleItems = Math.max(3, Math.floor((termRows - 22) / 3));
+  const multiselectSelectedIndex =
+    pendingInput?.type === "multiselect" ? pendingInput.selectedIndex : -1;
+  useEffect(() => {
+    if (multiselectSelectedIndex < 0) return;
+    setMultiselectScrollOffset((prev) => {
+      if (multiselectSelectedIndex < prev) return multiselectSelectedIndex;
+      if (multiselectSelectedIndex >= prev + maxVisibleItems) {
+        return multiselectSelectedIndex - maxVisibleItems + 1;
+      }
+      return prev;
+    });
+  }, [multiselectSelectedIndex, maxVisibleItems]);
 
   const updateStep = useCallback((i: number, patch: Partial<StepState>) => {
     setSteps((prev) =>
@@ -179,6 +215,7 @@ export function ReadyForReview({
         const preChecked = new Set(
           items.filter((f) => f.severity === "high").map((f) => f.id),
         );
+        setMultiselectScrollOffset(0);
         setPendingInput({
           type: "multiselect",
           prompt,
@@ -594,7 +631,7 @@ If tests are genuinely failing, fix the source code or tests. Only modify test f
         `Get the list of changed files: git diff --name-only ${remote}/main...HEAD
 
 For each changed file check:
-- Is there a corresponding entry in docs/feature-designs/?
+- Is there a corresponding entry within docs/?
 - Are there any JSDoc/TSDoc comments on exported functions that are now stale?
 - Are there any README or setup docs that reference changed behaviour?
 
@@ -747,10 +784,28 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
           label: "Writing squashed commit message…",
           status: "running",
         });
-        const msg = await claudeRun(
-          `Write a git commit message describing the full set of changes on this branch. Follow conventional commits format if appropriate. Return ONLY the commit message — subject line, blank line, then body if needed. Nothing else.\n\n${branchDiff}`,
+        const rawMsg = await claudeRun(
+          `Write a git commit message for the full set of changes on this branch.
+
+Format:
+- Line 1: a concise subject (≤ 72 chars, imperative mood, no trailing period). Follow conventional commits if appropriate.
+- Line 2: blank
+- Lines 3+: a body describing what changed and why, wrapped at ~72 chars per line.
+
+Output rules — these are strict:
+- Output the raw commit message text only.
+- Do NOT wrap the message in triple backticks, single backticks, quotes, or any other code fence.
+- Do NOT prefix with "Subject:", "Title:", "Body:", or any commentary.
+- The very first character of your reply must be the first character of the subject line.
+
+Diff:
+${branchDiff}`,
           cwd,
         );
+        const msg = sanitizeCommitMessage(rawMsg);
+        if (!msg) {
+          throw new Error("Claude returned an empty commit message");
+        }
 
         // Reset to main keeping everything staged, then commit as one.
         await run(`git reset --soft ${remote}/main`, { cwd });
@@ -896,48 +951,75 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
         ))}
       </Box>
 
-      {pendingInput?.type === "multiselect" && (
-        <Box
-          flexDirection="column"
-          borderStyle="round"
-          borderColor="yellow"
-          paddingX={1}
-          gap={0}
-        >
-          <Text color="yellow">{pendingInput.prompt}</Text>
-          <Box flexDirection="column">
-            {pendingInput.items.map((item, idx) => {
-              const sel = idx === pendingInput.selectedIndex;
-              const checked = pendingInput.checked.has(item.id);
-              const sevColor =
-                item.severity === "high"
-                  ? "red"
-                  : item.severity === "medium"
-                    ? "yellow"
-                    : "gray";
-              return (
-                <Box key={item.id} gap={1}>
-                  <Text color={sel ? "cyan" : undefined} bold={sel}>
-                    {sel ? ">" : " "}
-                  </Text>
-                  <Text color={checked ? "green" : "gray"}>
-                    {checked ? "[x]" : "[ ]"}
-                  </Text>
-                  <Text color={sevColor}>{item.severity}</Text>
-                  <Text dimColor>
-                    {item.file}
-                    {item.line ? `:${item.line}` : ""}
-                  </Text>
-                  <Text wrap="truncate">{item.description}</Text>
-                </Box>
-              );
-            })}
-          </Box>
-          <Text dimColor>
-            ↑↓ navigate Space toggle a toggle all Enter confirm
-          </Text>
-        </Box>
-      )}
+      {pendingInput?.type === "multiselect" &&
+        (() => {
+          const items = pendingInput.items;
+          const start = Math.min(
+            multiselectScrollOffset,
+            Math.max(0, items.length - maxVisibleItems),
+          );
+          const end = Math.min(items.length, start + maxVisibleItems);
+          const hiddenAbove = start;
+          const hiddenBelow = items.length - end;
+          const visible = items.slice(start, end);
+          return (
+            <Box
+              flexDirection="column"
+              borderStyle="round"
+              borderColor="yellow"
+              paddingX={1}
+              gap={0}
+            >
+              <Text color="yellow">{pendingInput.prompt}</Text>
+              {hiddenAbove > 0 && (
+                <Text dimColor>↑ {hiddenAbove} more above</Text>
+              )}
+              <Box flexDirection="column">
+                {visible.map((item, visibleIdx) => {
+                  const idx = start + visibleIdx;
+                  const sel = idx === pendingInput.selectedIndex;
+                  const checked = pendingInput.checked.has(item.id);
+                  const sevColor =
+                    item.severity === "high"
+                      ? "red"
+                      : item.severity === "medium"
+                        ? "yellow"
+                        : "gray";
+                  return (
+                    <Box key={item.id} gap={1}>
+                      <Box width={1} flexShrink={0}>
+                        <Text color={sel ? "cyan" : undefined} bold={sel}>
+                          {sel ? ">" : " "}
+                        </Text>
+                      </Box>
+                      <Box width={3} flexShrink={0}>
+                        <Text color={checked ? "green" : "gray"}>
+                          {checked ? "[x]" : "[ ]"}
+                        </Text>
+                      </Box>
+                      <Box width={6} flexShrink={0}>
+                        <Text color={sevColor}>{item.severity}</Text>
+                      </Box>
+                      <Box flexGrow={1} flexShrink={1} flexDirection="column">
+                        <Text>{item.description}</Text>
+                        <Text dimColor wrap="truncate-middle">
+                          {item.file}
+                          {item.line ? `:${item.line}` : ""}
+                        </Text>
+                      </Box>
+                    </Box>
+                  );
+                })}
+              </Box>
+              {hiddenBelow > 0 && (
+                <Text dimColor>↓ {hiddenBelow} more below</Text>
+              )}
+              <Text dimColor>
+                ↑↓ navigate Space toggle a toggle all Enter confirm
+              </Text>
+            </Box>
+          );
+        })()}
 
       {pendingInput?.type === "keys" && (
         <Box
