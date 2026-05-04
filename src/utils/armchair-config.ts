@@ -4,26 +4,27 @@ import * as path from "node:path";
 
 const CONFIG_DIR = path.join(os.homedir(), ".config", "armchair");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const GLOBAL_KEY = "__global__";
 
-type WorktreeConfig = { appDirs: string[] };
-type ConfigFile = Record<string, WorktreeConfig>;
+export type GlobalConfig = {
+  appRelDirs?: string[];
+  testCommand?: string;
+  lintCommands?: string[];
+};
 
-export async function loadConfig(
-  worktreePath: string,
-): Promise<WorktreeConfig | null> {
+type ConfigFile = Record<string, unknown>;
+
+export async function loadGlobalConfig(): Promise<GlobalConfig> {
   try {
     const content = await readFile(CONFIG_PATH, "utf8");
     const file = JSON.parse(content) as ConfigFile;
-    return file[worktreePath] ?? null;
+    return (file[GLOBAL_KEY] as GlobalConfig) ?? {};
   } catch {
-    return null;
+    return {};
   }
 }
 
-export async function saveConfig(
-  worktreePath: string,
-  config: WorktreeConfig,
-): Promise<void> {
+export async function saveGlobalConfig(patch: Partial<GlobalConfig>): Promise<void> {
   let file: ConfigFile = {};
   try {
     const content = await readFile(CONFIG_PATH, "utf8");
@@ -31,7 +32,8 @@ export async function saveConfig(
   } catch {
     // first write
   }
-  file[worktreePath] = config;
+  const existing = (file[GLOBAL_KEY] as GlobalConfig | undefined) ?? {};
+  file[GLOBAL_KEY] = { ...existing, ...patch };
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeFile(CONFIG_PATH, JSON.stringify(file, null, 2));
 }

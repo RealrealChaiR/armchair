@@ -56,6 +56,14 @@ export async function getMainBranchWorktreePath(): Promise<string | null> {
   return null;
 }
 
+export async function deleteWorktree(
+  worktreePath: string,
+  branch: string,
+): Promise<void> {
+  await run(`git worktree remove --force ${worktreePath}`);
+  await run(`git branch -D ${branch}`);
+}
+
 export async function checkRemoteBranch(name: string): Promise<string | null> {
   for (const remote of ["upstream", "origin"]) {
     try {
@@ -70,18 +78,31 @@ export async function checkRemoteBranch(name: string): Promise<string | null> {
   return null;
 }
 
+export async function getPrimaryRemote(cwd?: string): Promise<string | null> {
+  for (const remote of ["upstream", "origin"]) {
+    try {
+      const { stdout } = await run(`git remote get-url ${remote}`, { cwd });
+      if (stdout.trim()) return remote;
+    } catch {
+      // remote doesn't exist, try next
+    }
+  }
+  return null;
+}
+
+export async function fetchAndUpdateMain(
+  remote: string,
+  mainBranchPath: string,
+): Promise<void> {
+  await run(`git fetch ${remote}`);
+  await run(`git merge --ff-only ${remote}/main`, { cwd: mainBranchPath });
+}
+
 export async function addWorktree(
   name: string,
   destPath: string,
-  trackRemote?: string,
 ): Promise<void> {
-  if (trackRemote) {
-    await run(
-      `git worktree add --track -b ${name} ${destPath} ${trackRemote}/${name}`,
-    );
-  } else {
-    await run(`git worktree add -b ${name} ${destPath}`);
-  }
+  await run(`git worktree add -b ${name} ${destPath} main`);
 }
 
 export async function copyEnvFile(

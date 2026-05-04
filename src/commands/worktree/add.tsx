@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { Box, Text, useInput, useStdin } from "ink";
+import { Box, Text } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Footer } from "../../components/Footer.js";
@@ -7,10 +7,11 @@ import { useQuit } from "../../hooks/useQuit.js";
 import { run } from "../../utils/exec.js";
 import {
   addWorktree,
-  checkRemoteBranch,
   copyEnvFile,
+  fetchAndUpdateMain,
   getMainBranchWorktreePath,
   getMainWorktreePath,
+  getPrimaryRemote,
 } from "../../utils/worktree.js";
 
 type StepStatus = "pending" | "running" | "done" | "error";
@@ -21,12 +22,7 @@ type StepState = {
   detail?: string;
 };
 
-type Phase =
-  | { type: "checking" }
-  | { type: "confirm"; remote: string }
-  | { type: "running" }
-  | { type: "done" }
-  | { type: "error"; message: string };
+type Phase = { type: "running" } | { type: "done" } | { type: "error"; message: string };
 
 function stepIcon(status: StepStatus): string {
   if (status === "running") return "●";
@@ -46,9 +42,10 @@ type Props = { name: string; onDone?: () => void };
 
 export function WorktreeAdd({ name, onDone }: Props) {
   useQuit();
-  const { isRawModeSupported } = useStdin();
-  const [phase, setPhase] = useState<Phase>({ type: "checking" });
+  const [phase, setPhase] = useState<Phase>({ type: "running" });
   const [steps, setSteps] = useState<StepState[]>([
+    { label: "Fetching from remote", status: "pending" },
+    { label: "Updating main", status: "pending" },
     { label: "Creating worktree", status: "pending" },
     { label: "Copying .env", status: "pending" },
     { label: "Installing dependencies", status: "pending" },
@@ -61,78 +58,89 @@ export function WorktreeAdd({ name, onDone }: Props) {
     );
   }, []);
 
-  const execute = useCallback(
-    async (trackRemote: string | null) => {
-      if (executing.current) {
-        return;
-      }
-      executing.current = true;
-      setPhase({ type: "running" });
+  const execute = useCallback(async () => {
+    if (executing.current) return;
+    executing.current = true;
 
-      let mainPath: string;
-      let destPath: string;
+    let mainPath: string;
+    let destPath: string;
 
-      updateStep(0, { status: "running" });
-      try {
-        mainPath = await getMainWorktreePath();
-        destPath = path.join(mainPath, name);
-        updateStep(0, {
-          label: `Creating worktree at ${path.relative(process.cwd(), destPath)}`,
-        });
-        await addWorktree(name, destPath, trackRemote ?? undefined);
-        updateStep(0, { status: "done" });
-      } catch (err) {
-        updateStep(0, { status: "error", detail: String(err) });
-        setPhase({ type: "error", message: String(err) });
-        return;
-      }
-
-      updateStep(1, { status: "running" });
-      try {
+    // ── step 0: fetch from remote ──────────────────────────────────────────
+    updateStep(0, { status: "running" });
+    let remote: string | null = null;
+    try {
+      remote = await getPrimaryRemote();
+      if (!remote) {
+        updateStep(0, { status: "done", label: "No remote found, skipped" });
+      } else {
+        updateStep(0, { label: `Fetching from ${remote}`, status: "running" });
         const mainBranchPath = await getMainBranchWorktreePath();
-        const copied = mainBranchPath
-          ? await copyEnvFile(mainBranchPath, destPath)
-          : false;
-        updateStep(1, {
-          status: "done",
-          label: copied ? "Copied .env" : ".env not found, skipped",
-        });
-      } catch (err) {
-        updateStep(1, { status: "error", detail: String(err) });
-        setPhase({ type: "error", message: String(err) });
-        return;
+        await fetchAndUpdateMain(remote, mainBranchPath ?? process.cwd());
+        updateStep(0, { label: `Fetched from ${remote}`, status: "done" });
       }
+    } catch (err) {
+      updateStep(0, { status: "error", detail: String(err) });
+      setPhase({ type: "error", message: String(err) });
+      return;
+    }
 
-      updateStep(2, { status: "running" });
-      try {
-        await run("pnpm install", { cwd: destPath });
-        updateStep(2, { status: "done" });
-      } catch (err) {
-        updateStep(2, { status: "error", detail: String(err) });
-        setPhase({ type: "error", message: String(err) });
-        return;
-      }
+    // ── step 1: update main ────────────────────────────────────────────────
+    // Already done inside fetchAndUpdateMain above; mark done or skipped.
+    updateStep(1, {
+      status: "done",
+      label: remote ? "main updated to latest" : "No remote, skipped",
+    });
 
-      setPhase({ type: "done" });
-    },
-    [name, updateStep],
-  );
+    // ── step 2: create worktree ────────────────────────────────────────────
+    updateStep(2, { status: "running" });
+    try {
+      mainPath = await getMainWorktreePath();
+      destPath = path.join(mainPath, name);
+      updateStep(2, {
+        label: `Creating worktree at ${path.relative(process.cwd(), destPath)}`,
+      });
+      await addWorktree(name, destPath);
+      updateStep(2, { status: "done" });
+    } catch (err) {
+      updateStep(2, { status: "error", detail: String(err) });
+      setPhase({ type: "error", message: String(err) });
+      return;
+    }
+
+    // ── step 3: copy .env ──────────────────────────────────────────────────
+    updateStep(3, { status: "running" });
+    try {
+      const mainBranchPath = await getMainBranchWorktreePath();
+      const copied = mainBranchPath
+        ? await copyEnvFile(mainBranchPath, destPath)
+        : false;
+      updateStep(3, {
+        status: "done",
+        label: copied ? "Copied .env" : ".env not found, skipped",
+      });
+    } catch (err) {
+      updateStep(3, { status: "error", detail: String(err) });
+      setPhase({ type: "error", message: String(err) });
+      return;
+    }
+
+    // ── step 4: pnpm install ───────────────────────────────────────────────
+    updateStep(4, { status: "running" });
+    try {
+      await run("pnpm install", { cwd: destPath });
+      updateStep(4, { status: "done" });
+    } catch (err) {
+      updateStep(4, { status: "error", detail: String(err) });
+      setPhase({ type: "error", message: String(err) });
+      return;
+    }
+
+    setPhase({ type: "done" });
+  }, [name, updateStep]);
 
   useEffect(() => {
-    async function check() {
-      try {
-        const remote = await checkRemoteBranch(name);
-        if (remote) {
-          setPhase({ type: "confirm", remote });
-        } else {
-          await execute(null);
-        }
-      } catch (err) {
-        setPhase({ type: "error", message: String(err) });
-      }
-    }
-    void check();
-  }, [name, execute]);
+    void execute();
+  }, [execute]);
 
   useEffect(() => {
     if (phase.type === "done" && onDone) {
@@ -140,21 +148,6 @@ export function WorktreeAdd({ name, onDone }: Props) {
       return () => clearTimeout(t);
     }
   }, [phase.type, onDone]);
-
-  useInput((input, key) => {
-    if (phase.type !== "confirm") {
-      return;
-    }
-    const { remote } = phase;
-    if (input === "y" || input === "Y" || key.return) {
-      void execute(remote);
-    } else if (input === "n" || input === "N") {
-      void execute(null);
-    }
-  }, { isActive: isRawModeSupported === true });
-
-  const showSteps =
-    phase.type === "running" || phase.type === "done" || phase.type === "error";
 
   return (
     <Box flexDirection="column" padding={1} gap={1}>
@@ -165,35 +158,19 @@ export function WorktreeAdd({ name, onDone }: Props) {
         </Text>
       </Box>
 
-      {phase.type === "checking" && (
-        <Text dimColor>Checking for remote branch…</Text>
-      )}
-
-      {phase.type === "confirm" && (
-        <Box gap={1}>
-          <Text>
-            Remote branch found on <Text color="yellow">{phase.remote}</Text>.
-            Track it?
-          </Text>
-          <Text dimColor>[Y/n]</Text>
-        </Box>
-      )}
-
-      {showSteps && (
-        <Box flexDirection="column">
-          {steps.map((step, i) => (
-            <Box key={i} gap={1}>
-              <Text color={stepColor(step.status)}>
-                {stepIcon(step.status)}
-              </Text>
-              <Text dimColor={step.status === "pending"}>{step.label}</Text>
-              {step.detail !== undefined && (
-                <Text color="red">{step.detail}</Text>
-              )}
-            </Box>
-          ))}
-        </Box>
-      )}
+      <Box flexDirection="column">
+        {steps.map((step, i) => (
+          <Box key={i} gap={1}>
+            <Text color={stepColor(step.status)}>
+              {stepIcon(step.status)}
+            </Text>
+            <Text dimColor={step.status === "pending"}>{step.label}</Text>
+            {step.detail !== undefined && (
+              <Text color="red">{step.detail}</Text>
+            )}
+          </Box>
+        ))}
+      </Box>
 
       {phase.type === "done" && <Text color="green">Done!</Text>}
       <Footer />

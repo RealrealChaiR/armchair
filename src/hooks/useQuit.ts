@@ -8,6 +8,7 @@ export function useQuit(isActive = true) {
 		(input) => {
 			if (input === "q") {
 				exit();
+				process.exit(0);
 			}
 		},
 		{ isActive: isRawModeSupported === true && isActive },

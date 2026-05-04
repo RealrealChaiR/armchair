@@ -18,8 +18,9 @@ export async function discoverApps(worktreePath: string): Promise<AppInfo[]> {
   const apps: AppInfo[] = [];
 
   for (const pattern of patterns) {
-    // Only handle simple "dir/*" patterns
+    // Only handle simple "dir/*" patterns, and only apps/ not packages/
     if (!pattern.endsWith("/*")) continue;
+    if (!pattern.startsWith("apps/")) continue;
     const parentDir = path.join(worktreePath, pattern.slice(0, -2));
     let entries;
     try {
