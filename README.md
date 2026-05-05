@@ -2,6 +2,12 @@
 
 Terminal-based dev tools written in TypeScript using [Ink](https://github.com/vadimdemedes/ink).
 
+## Screenshots
+
+![Worktree manager grid](docs/worktree-manager.png)
+
+![Review pipeline](docs/review-pipeline.png)
+
 ## Installation
 
 Requires [pnpm](https://pnpm.io/installation) and Node.js.
