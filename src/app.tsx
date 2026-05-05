@@ -1,6 +1,7 @@
 import { Box, Text, useInput, useStdin } from "ink";
 import { useState } from "react";
 
+import { WorktreeCreate } from "./commands/worktree/create.js";
 import { WorktreeManager } from "./commands/worktree/manager.js";
 import { Footer } from "./components/Footer.js";
 import { useQuit } from "./hooks/useQuit.js";
@@ -10,9 +11,16 @@ const COMMANDS = [
     label: "worktree manager",
     description: "Manage and switch between worktrees",
   },
+  {
+    label: "worktree create",
+    description: "Clone and initialize a new bare-repo project",
+  },
 ];
 
-type AppScreen = { type: "menu"; index: number } | { type: "worktree-manager" };
+type AppScreen =
+  | { type: "menu"; index: number }
+  | { type: "worktree-manager" }
+  | { type: "worktree-create" };
 
 export function App({ startAtManager = false }: { startAtManager?: boolean }) {
   const { isRawModeSupported } = useStdin();
@@ -36,7 +44,8 @@ export function App({ startAtManager = false }: { startAtManager?: boolean }) {
             : s,
         );
       } else if (key.return) {
-        setScreen({ type: "worktree-manager" });
+        if (screen.index === 0) setScreen({ type: "worktree-manager" });
+        else if (screen.index === 1) setScreen({ type: "worktree-create" });
       }
     },
     { isActive: isRawModeSupported === true },
@@ -45,6 +54,12 @@ export function App({ startAtManager = false }: { startAtManager?: boolean }) {
   if (screen.type === "worktree-manager") {
     return (
       <WorktreeManager onBack={() => setScreen({ type: "menu", index: 0 })} />
+    );
+  }
+
+  if (screen.type === "worktree-create") {
+    return (
+      <WorktreeCreate onDone={() => setScreen({ type: "menu", index: 1 })} />
     );
   }
 
