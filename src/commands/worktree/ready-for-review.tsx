@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { WorktreeInfo } from "../../utils/worktree.js";
 import { Box, Text, useInput, useStdin, useStdout } from "ink";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 
 import { Footer } from "../../components/Footer.js";
 import {
@@ -112,227 +112,129 @@ function sanitizeCommitMessage(raw: string): string {
   return msg;
 }
 
-// ─── component ───────────────────────────────────────────────────────────────
+// ─── pipeline store ──────────────────────────────────────────────────────────
+// State lives at module level so it survives Ink unmount/remount cycles (e.g.
+// when the user enters a passthrough session and returns to the manager).
 
-const INITIAL_STEPS: StepState[] = [
-  { label: "Rebase onto main", status: "pending" },
-  { label: "AI code review", status: "pending" },
-  { label: "Run tests", status: "pending" },
-  { label: "Check documentation", status: "pending" },
-  { label: "Run linters", status: "pending" },
-  { label: "Commit & push", status: "pending" },
-  { label: "Open / update PR", status: "pending" },
-];
+type PipelineStore = {
+  worktree: WorktreeInfo;
+  steps: StepState[];
+  phase: Phase;
+  pendingInput: PendingInput | null;
+  executing: boolean;
+  resolveInput: ((key: string) => void) | null;
+  resolveMultiselect: ((ids: number[]) => void) | null;
+  resolveTextInput: ((value: string) => void) | null;
+  onPRChangeRef: { current: (() => void) | undefined };
+  subscribers: Set<() => void>;
+};
 
-export function ReadyForReview({
-  worktree,
-  isVisible,
-  onDone,
-  onStatusChange,
-  onPRChange,
-}: Props) {
-  const { isRawModeSupported } = useStdin();
-  const { stdout } = useStdout();
-  const [steps, setSteps] = useState<StepState[]>(INITIAL_STEPS);
-  const [phase, setPhase] = useState<Phase>({ type: "running" });
-  const [pendingInput, setPendingInput] = useState<PendingInput | null>(null);
-  const [multiselectScrollOffset, setMultiselectScrollOffset] = useState(0);
-  const resolveInputRef = useRef<((key: string) => void) | null>(null);
-  const resolveMultiselectRef = useRef<((ids: number[]) => void) | null>(null);
-  const resolveTextInputRef = useRef<((value: string) => void) | null>(null);
-  const executing = useRef(false);
+const pipelineStores = new Map<string, PipelineStore>();
 
-  // Keep a stable ref so the status-change effect doesn't depend on the callback identity
-  const onStatusChangeRef = useRef(onStatusChange);
-  onStatusChangeRef.current = onStatusChange;
-  const onPRChangeRef = useRef(onPRChange);
-  onPRChangeRef.current = onPRChange;
-
-  // Report review status to the parent grid whenever it changes
-  useEffect(() => {
-    const status: ReviewStatus | null =
-      phase.type === "done"
-        ? "reviewed"
-        : phase.type === "error"
-          ? null
-          : pendingInput?.type === "multiselect"
-            ? "needs-input"
-            : "reviewing";
-    onStatusChangeRef.current(status);
-    // onStatusChangeRef is a ref — intentionally omitted from deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase.type, pendingInput?.type]);
-
-  // Keep the multiselect cursor within the visible scroll window
-  const termRows = stdout?.rows ?? 24;
-  // Each item is budgeted 3 rows (description usually wraps + file/line line)
-  const maxVisibleItems = Math.max(3, Math.floor((termRows - 22) / 3));
-  const multiselectSelectedIndex =
-    pendingInput?.type === "multiselect" ? pendingInput.selectedIndex : -1;
-  useEffect(() => {
-    if (multiselectSelectedIndex < 0) return;
-    setMultiselectScrollOffset((prev) => {
-      if (multiselectSelectedIndex < prev) return multiselectSelectedIndex;
-      if (multiselectSelectedIndex >= prev + maxVisibleItems) {
-        return multiselectSelectedIndex - maxVisibleItems + 1;
-      }
-      return prev;
+function getOrCreateStore(worktree: WorktreeInfo): PipelineStore {
+  if (!pipelineStores.has(worktree.path)) {
+    pipelineStores.set(worktree.path, {
+      worktree,
+      steps: INITIAL_STEPS.map((s) => ({ ...s })),
+      phase: { type: "running" },
+      pendingInput: null,
+      executing: false,
+      resolveInput: null,
+      resolveMultiselect: null,
+      resolveTextInput: null,
+      onPRChangeRef: { current: undefined },
+      subscribers: new Set(),
     });
-  }, [multiselectSelectedIndex, maxVisibleItems]);
+  }
+  return pipelineStores.get(worktree.path)!;
+}
 
-  const updateStep = useCallback((i: number, patch: Partial<StepState>) => {
-    setSteps((prev) =>
-      prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)),
-    );
-  }, []);
+function notifyStore(path: string): void {
+  const store = pipelineStores.get(path);
+  if (store) for (const sub of store.subscribers) sub();
+}
 
-  const appendOutput = useCallback((i: number, line: string) => {
-    setSteps((prev) =>
-      prev.map((s, idx) =>
-        idx === i
-          ? { ...s, outputLines: [...(s.outputLines ?? []).slice(-49), line] }
-          : s,
-      ),
-    );
-  }, []);
+function pipelineUpdateStep(path: string, i: number, patch: Partial<StepState>): void {
+  const store = pipelineStores.get(path);
+  if (!store) return;
+  store.steps = store.steps.map((s, idx) => (idx === i ? { ...s, ...patch } : s));
+  notifyStore(path);
+}
 
-  const askUser = useCallback(
-    (
-      prompt: string,
-      options: { key: string; label: string }[],
-    ): Promise<string> =>
-      new Promise((resolve) => {
-        resolveInputRef.current = resolve;
-        setPendingInput({ type: "keys", prompt, options });
-      }),
-    [],
+function pipelineAppendOutput(path: string, i: number, line: string): void {
+  const store = pipelineStores.get(path);
+  if (!store) return;
+  store.steps = store.steps.map((s, idx) =>
+    idx === i
+      ? { ...s, outputLines: [...(s.outputLines ?? []).slice(-49), line] }
+      : s,
   );
+  notifyStore(path);
+}
 
-  const askMultiselect = useCallback(
-    (prompt: string, items: ReviewFinding[]): Promise<number[]> =>
-      new Promise((resolve) => {
-        resolveMultiselectRef.current = resolve;
-        const preChecked = new Set(
-          items.filter((f) => f.severity === "high").map((f) => f.id),
-        );
-        setMultiselectScrollOffset(0);
-        setPendingInput({
-          type: "multiselect",
-          prompt,
-          items,
-          checked: preChecked,
-          selectedIndex: 0,
-        });
-      }),
-    [],
-  );
+function pipelineSetPhase(path: string, phase: Phase): void {
+  const store = pipelineStores.get(path);
+  if (!store) return;
+  store.phase = phase;
+  if (phase.type !== "running") store.executing = false;
+  notifyStore(path);
+}
 
-  const askTextInput = useCallback(
-    (prompt: string): Promise<string> =>
-      new Promise((resolve) => {
-        resolveTextInputRef.current = resolve;
-        setPendingInput({ type: "text-input", prompt, value: "" });
-      }),
-    [],
-  );
+function pipelineSetPendingInput(path: string, input: PendingInput | null): void {
+  const store = pipelineStores.get(path);
+  if (!store) return;
+  store.pendingInput = input;
+  notifyStore(path);
+}
 
-  useInput(
-    (input, key) => {
-      if (pendingInput?.type === "multiselect") {
-        if (key.upArrow) {
-          setPendingInput((p) =>
-            p?.type === "multiselect"
-              ? { ...p, selectedIndex: Math.max(0, p.selectedIndex - 1) }
-              : p,
-          );
-        } else if (key.downArrow) {
-          setPendingInput((p) =>
-            p?.type === "multiselect"
-              ? {
-                  ...p,
-                  selectedIndex: Math.min(
-                    p.items.length - 1,
-                    p.selectedIndex + 1,
-                  ),
-                }
-              : p,
-          );
-        } else if (input === " ") {
-          setPendingInput((p) => {
-            if (p?.type !== "multiselect") return p;
-            const id = p.items[p.selectedIndex]?.id;
-            if (id === undefined) return p;
-            const checked = new Set(p.checked);
-            if (checked.has(id)) checked.delete(id);
-            else checked.add(id);
-            return { ...p, checked };
-          });
-        } else if (input === "a") {
-          setPendingInput((p) => {
-            if (p?.type !== "multiselect") return p;
-            const allSelected = p.checked.size === p.items.length;
-            return {
-              ...p,
-              checked: allSelected
-                ? new Set()
-                : new Set(p.items.map((i) => i.id)),
-            };
-          });
-        } else if (key.return) {
-          const resolve = resolveMultiselectRef.current;
-          const ids = pendingInput ? [...pendingInput.checked] : [];
-          resolveMultiselectRef.current = null;
-          setPendingInput(null);
-          resolve?.(ids);
-        }
-        return;
-      }
-      if (pendingInput?.type === "text-input") {
-        if (key.return) {
-          const resolve = resolveTextInputRef.current;
-          const value = pendingInput.value;
-          resolveTextInputRef.current = null;
-          setPendingInput(null);
-          resolve?.(value);
-        } else if (key.escape) {
-          const resolve = resolveTextInputRef.current;
-          resolveTextInputRef.current = null;
-          setPendingInput(null);
-          resolve?.("");
-        } else if (key.backspace || key.delete) {
-          setPendingInput((p) =>
-            p?.type === "text-input"
-              ? { ...p, value: p.value.slice(0, -1) }
-              : p,
-          );
-        } else if (input && !key.ctrl && !key.meta) {
-          setPendingInput((p) =>
-            p?.type === "text-input" ? { ...p, value: p.value + input } : p,
-          );
-        }
-        return;
-      }
-      if (pendingInput?.type === "keys" && resolveInputRef.current) {
-        const opt = pendingInput.options.find((o) => o.key === input);
-        if (opt) {
-          const resolve = resolveInputRef.current;
-          resolveInputRef.current = null;
-          setPendingInput(null);
-          resolve(opt.key);
-        }
-        return;
-      }
-    },
-    { isActive: isRawModeSupported === true && isVisible },
-  );
+function pipelineAskUser(
+  path: string,
+  prompt: string,
+  options: { key: string; label: string }[],
+): Promise<string> {
+  return new Promise((resolve) => {
+    const store = pipelineStores.get(path)!;
+    store.resolveInput = resolve;
+    pipelineSetPendingInput(path, { type: "keys", prompt, options });
+  });
+}
 
-  // ─── pipeline ───────────────────────────────────────────────────────────────
+function pipelineAskMultiselect(path: string, prompt: string, items: ReviewFinding[]): Promise<number[]> {
+  return new Promise((resolve) => {
+    const store = pipelineStores.get(path)!;
+    store.resolveMultiselect = resolve;
+    const preChecked = new Set(items.filter((f) => f.severity === "high").map((f) => f.id));
+    pipelineSetPendingInput(path, {
+      type: "multiselect",
+      prompt,
+      items,
+      checked: preChecked,
+      selectedIndex: 0,
+    });
+  });
+}
 
-  const execute = useCallback(async () => {
-    if (executing.current) return;
-    executing.current = true;
+function pipelineAskTextInput(path: string, prompt: string): Promise<string> {
+  return new Promise((resolve) => {
+    const store = pipelineStores.get(path)!;
+    store.resolveTextInput = resolve;
+    pipelineSetPendingInput(path, { type: "text-input", prompt, value: "" });
+  });
+}
 
-    const cwd = worktree.path;
+// ─── pipeline runner (module-level so it outlives component unmounts) ────────
+
+async function runPipeline(path: string): Promise<void> {
+  const store = pipelineStores.get(path)!;
+  const cwd = path;
+  const updateStep = (i: number, patch: Partial<StepState>) => pipelineUpdateStep(path, i, patch);
+  const appendOutput = (i: number, line: string) => pipelineAppendOutput(path, i, line);
+  const setPhase = (p: Phase) => pipelineSetPhase(path, p);
+  const askUser = (prompt: string, options: { key: string; label: string }[]) =>
+    pipelineAskUser(path, prompt, options);
+  const askMultiselect = (prompt: string, items: ReviewFinding[]) =>
+    pipelineAskMultiselect(path, prompt, items);
+  const askTextInput = (prompt: string) => pipelineAskTextInput(path, prompt);
 
     // ── step 0: rebase ──────────────────────────────────────────────────────
     updateStep(0, { status: "running" });
@@ -754,10 +656,6 @@ Fix the issues. Do not add eslint-disable comments unless it is a genuine false 
       const remote = (await getPrimaryRemote(cwd)) ?? "origin";
       await run("git add -A", { cwd });
 
-      // Full branch diff vs main: committed branch work + the wip checkpoint
-      // + any AI-driven fixes from earlier review steps + any still-uncommitted
-      // tree changes. Squashing everything into one commit gives Claude the
-      // complete intent for the message and produces a clean PR history.
       const { stdout: branchDiff } = await run(`git diff ${remote}/main`, {
         cwd,
       });
@@ -841,10 +739,10 @@ ${branchDiff}`,
           label: `Draft PR opened — ${prUrl}`,
           status: "done",
         });
-        onPRChangeRef.current?.();
+        store.onPRChangeRef.current?.();
       } else {
         prUrl = existingPr.url;
-        onPRChangeRef.current?.();
+        store.onPRChangeRef.current?.();
         updateStep(6, {
           label: "Reviewing PR description…",
           status: "running",
@@ -888,18 +786,165 @@ ${log}`,
     }
 
     setPhase({ type: "done", prUrl });
-  }, [
-    worktree,
-    updateStep,
-    appendOutput,
-    askUser,
-    askMultiselect,
-    askTextInput,
-  ]);
+}
+
+// ─── component ───────────────────────────────────────────────────────────────
+
+const INITIAL_STEPS: StepState[] = [
+  { label: "Rebase onto main", status: "pending" },
+  { label: "AI code review", status: "pending" },
+  { label: "Run tests", status: "pending" },
+  { label: "Check documentation", status: "pending" },
+  { label: "Run linters", status: "pending" },
+  { label: "Commit & push", status: "pending" },
+  { label: "Open / update PR", status: "pending" },
+];
+
+export function ReadyForReview({
+  worktree,
+  isVisible,
+  onDone,
+  onStatusChange,
+  onPRChange,
+}: Props) {
+  const { isRawModeSupported } = useStdin();
+  const { stdout } = useStdout();
+  const path = worktree.path;
+
+  // Ensure store exists and keep the PR-change callback current
+  const store = getOrCreateStore(worktree);
+  store.onPRChangeRef.current = onPRChange;
+
+  // Force re-render whenever the store notifies
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    store.subscribers.add(rerender);
+    rerender();
+    return () => { store.subscribers.delete(rerender); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  const { steps, phase, pendingInput } = store;
+
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+
+  // Report review status to the parent grid whenever it changes
+  useEffect(() => {
+    const status: ReviewStatus | null =
+      phase.type === "done"
+        ? "reviewed"
+        : phase.type === "error"
+          ? null
+          : pendingInput?.type === "multiselect"
+            ? "needs-input"
+            : "reviewing";
+    onStatusChangeRef.current(status);
+    // onStatusChangeRef is a ref — intentionally omitted from deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase.type, pendingInput?.type]);
+
+  // Keep the multiselect cursor within the visible scroll window
+  const termRows = stdout?.rows ?? 24;
+  const maxVisibleItems = Math.max(3, Math.floor((termRows - 22) / 3));
+  const [multiselectScrollOffset, setMultiselectScrollOffset] = useState(0);
+  const multiselectSelectedIndex =
+    pendingInput?.type === "multiselect" ? pendingInput.selectedIndex : -1;
+  useEffect(() => {
+    if (multiselectSelectedIndex < 0) return;
+    setMultiselectScrollOffset((prev) => {
+      if (multiselectSelectedIndex < prev) return multiselectSelectedIndex;
+      if (multiselectSelectedIndex >= prev + maxVisibleItems) {
+        return multiselectSelectedIndex - maxVisibleItems + 1;
+      }
+      return prev;
+    });
+  }, [multiselectSelectedIndex, maxVisibleItems]);
+
+  useInput(
+    (input, key) => {
+      if (pendingInput?.type === "multiselect") {
+        if (key.upArrow) {
+          pipelineSetPendingInput(path, pendingInput.type === "multiselect"
+            ? { ...pendingInput, selectedIndex: Math.max(0, pendingInput.selectedIndex - 1) }
+            : pendingInput);
+        } else if (key.downArrow) {
+          pipelineSetPendingInput(path, pendingInput.type === "multiselect"
+            ? { ...pendingInput, selectedIndex: Math.min(pendingInput.items.length - 1, pendingInput.selectedIndex + 1) }
+            : pendingInput);
+        } else if (input === " ") {
+          if (pendingInput.type === "multiselect") {
+            const id = pendingInput.items[pendingInput.selectedIndex]?.id;
+            if (id !== undefined) {
+              const checked = new Set(pendingInput.checked);
+              if (checked.has(id)) checked.delete(id); else checked.add(id);
+              pipelineSetPendingInput(path, { ...pendingInput, checked });
+            }
+          }
+        } else if (input === "a") {
+          if (pendingInput.type === "multiselect") {
+            const allSelected = pendingInput.checked.size === pendingInput.items.length;
+            pipelineSetPendingInput(path, {
+              ...pendingInput,
+              checked: allSelected ? new Set() : new Set(pendingInput.items.map((i) => i.id)),
+            });
+          }
+        } else if (key.return) {
+          const resolve = store.resolveMultiselect;
+          const ids = pendingInput.type === "multiselect" ? [...pendingInput.checked] : [];
+          store.resolveMultiselect = null;
+          pipelineSetPendingInput(path, null);
+          resolve?.(ids);
+        }
+        return;
+      }
+      if (pendingInput?.type === "text-input") {
+        if (key.return) {
+          const resolve = store.resolveTextInput;
+          const value = pendingInput.value;
+          store.resolveTextInput = null;
+          pipelineSetPendingInput(path, null);
+          resolve?.(value);
+        } else if (key.escape) {
+          const resolve = store.resolveTextInput;
+          store.resolveTextInput = null;
+          pipelineSetPendingInput(path, null);
+          resolve?.("");
+        } else if (key.backspace || key.delete) {
+          pipelineSetPendingInput(path, { ...pendingInput, value: pendingInput.value.slice(0, -1) });
+        } else if (input && !key.ctrl && !key.meta) {
+          pipelineSetPendingInput(path, { ...pendingInput, value: pendingInput.value + input });
+        }
+        return;
+      }
+      if (pendingInput?.type === "keys" && store.resolveInput) {
+        const opt = pendingInput.options.find((o) => o.key === input);
+        if (opt) {
+          const resolve = store.resolveInput;
+          store.resolveInput = null;
+          pipelineSetPendingInput(path, null);
+          resolve(opt.key);
+        }
+        return;
+      }
+    },
+    { isActive: isRawModeSupported === true && isVisible },
+  );
+
+  // ─── pipeline ───────────────────────────────────────────────────────────────
+
+  // ─── pipeline ───────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    void execute().catch((err) => setPhase({ type: "error", message: String(err) }));
-  }, [execute]);
+    if (store.executing) return;
+    store.executing = true;
+    void runPipeline(path).catch((err) =>
+      pipelineSetPhase(path, { type: "error", message: String(err) }),
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  // ─── end pipeline ────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (phase.type === "done" && isVisible) {
@@ -907,6 +952,7 @@ ${log}`,
       return () => clearTimeout(t);
     }
   }, [phase.type, isVisible, onDone]);
+
 
   // ─── render ────────────────────────────────────────────────────────────────
 
