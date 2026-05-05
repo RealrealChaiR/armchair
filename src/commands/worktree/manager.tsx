@@ -92,6 +92,7 @@ type Props = { onBack: () => void };
 // ─── main component ──────────────────────────────────────────────────────────
 
 const CARD_WIDTH = 32;
+let savedListIndex = 0;
 
 export function WorktreeManager({ onBack }: Props) {
   const { exit } = useApp();
@@ -136,7 +137,7 @@ export function WorktreeManager({ onBack }: Props) {
     listWorktrees()
       .then((all) => {
         const worktrees = all.filter((w) => !w.isBare);
-        setScreen({ type: "list", worktrees, selectedIndex: 0 });
+        setScreen({ type: "list", worktrees, selectedIndex: Math.min(savedListIndex, Math.max(0, worktrees.length - 1)) });
         // Fetch PRs in parallel, updating state as each resolves
         for (const wt of worktrees) {
           void getPRForBranch(wt.branch, wt.path).then((pr) => {
@@ -297,17 +298,19 @@ export function WorktreeManager({ onBack }: Props) {
           if (wt) {
             void getPrimaryRemote(wt.path).then((remote) => {
               const ref = `${remote ?? "origin"}/main`;
+              const isNew = !isSessionRunning(wt.path);
               startSession(
                 wt.path,
                 process.stdout.columns ?? 80,
                 process.stdout.rows ?? 24,
+                isNew
+                  ? `Analyse all changes on this branch. Run \`git diff --stat ${ref}\` for committed changes, \`git diff --staged\` for staged changes, and \`git diff\` for unstaged changes. Then give me a concise summary of what has changed.`
+                  : undefined,
               );
               subscribeIfNeeded(wt.path);
               acknowledgeSession(wt.path);
-              requestSession(
-                wt.path,
-                `Analyse all changes on this branch. Run \`git diff --stat ${ref}\` for committed changes, \`git diff --staged\` for staged changes, and \`git diff\` for unstaged changes. Then give me a concise summary of what has changed.`,
-              );
+              requestSession(wt.path);
+              savedListIndex = screen.selectedIndex;
               exit();
             });
           }

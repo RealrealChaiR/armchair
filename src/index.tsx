@@ -4,7 +4,6 @@ import { App } from "./app.js";
 import { WorktreeAdd } from "./commands/worktree/add.js";
 import { consumeSession } from "./utils/session-bridge.js";
 import {
-  getSessionStatus,
   onSessionExit,
   resizeSession,
   setPassthroughWriter,
@@ -29,12 +28,12 @@ async function main() {
     const session = consumeSession();
     if (!session) break;
 
-    await runClaudePassthrough(session.path, session.prompt ?? undefined);
+    await runClaudePassthrough(session.path);
     returnToManager = true; // go straight back to the worktree grid
   }
 }
 
-async function runClaudePassthrough(worktreePath: string, initialPrompt?: string): Promise<void> {
+async function runClaudePassthrough(worktreePath: string): Promise<void> {
   return new Promise((resolve) => {
     const cols = process.stdout.columns ?? 80;
     const rows = process.stdout.rows ?? 24;
@@ -47,19 +46,6 @@ async function runClaudePassthrough(worktreePath: string, initialPrompt?: string
     resizeSession(worktreePath, cols, rows);
     setTimeout(() => resizeSession(worktreePath, cols + 1, rows), 16);
     setTimeout(() => resizeSession(worktreePath, cols, rows), 32);
-
-    if (initialPrompt) {
-      let sent = false;
-      const poll = setInterval(() => {
-        if (sent) return;
-        if (getSessionStatus(worktreePath) === "waiting") {
-          sent = true;
-          clearInterval(poll);
-          writeToSession(worktreePath, initialPrompt);
-          setTimeout(() => writeToSession(worktreePath, "\r"), 100);
-        }
-      }, 200);
-    }
 
     process.stdin.setRawMode(true);
     process.stdin.resume();

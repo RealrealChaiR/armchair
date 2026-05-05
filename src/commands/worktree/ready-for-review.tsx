@@ -552,30 +552,47 @@ ${suggestionBlock}`,
       return;
     }
 
-    // ── step 2: tests ───────────────────────────────────────────────────────
-    updateStep(2, { status: "running" });
-    try {
-      let cfg = await loadGlobalConfig();
-      let testCmd = cfg.testCommand;
-
+    // ── steps 2, 3, 4: tests / docs / linters (parallel) ────────────────────
+    // Pre-flight: resolve unconfigured commands sequentially before fanning out,
+    // since both use askTextInput and can't overlap.
+    let testCmd: string | undefined;
+    {
+      const cfg = await loadGlobalConfig();
+      testCmd = cfg.testCommand;
       if (!testCmd) {
-        updateStep(2, {
-          label: "Test command not configured",
-          status: "waiting",
-        });
-        testCmd = await askTextInput(
-          "Enter the test command (e.g. pnpm test):",
-        );
-        if (!testCmd) {
-          updateStep(2, { label: "Tests skipped", status: "skipped" });
+        updateStep(2, { label: "Test command not configured", status: "waiting" });
+        const input = await askTextInput("Enter the test command (e.g. pnpm test):");
+        if (input) {
+          testCmd = input;
+          await saveGlobalConfig({ testCommand: input });
         } else {
-          await saveGlobalConfig({ testCommand: testCmd });
+          updateStep(2, { label: "Tests skipped", status: "skipped" });
         }
       }
+    }
 
-      if (testCmd) {
-        updateStep(2, { label: `Running ${testCmd}`, status: "running" });
+    let lintCmds: string[];
+    {
+      const cfg = await loadGlobalConfig();
+      lintCmds = cfg.lintCommands ?? [];
+      if (lintCmds.length === 0) {
+        updateStep(4, { label: "Lint commands not configured", status: "waiting" });
+        const input = await askTextInput(
+          "Enter lint commands, comma-separated (e.g. pnpm lint, pnpm typecheck):",
+        );
+        if (input) {
+          lintCmds = input.split(",").map((s) => s.trim()).filter(Boolean);
+          await saveGlobalConfig({ lintCommands: lintCmds });
+        } else {
+          updateStep(4, { label: "Lint skipped", status: "skipped" });
+        }
+      }
+    }
 
+    const runTests = async () => {
+      if (!testCmd) return;
+      updateStep(2, { label: `Running ${testCmd}`, status: "running" });
+      try {
         let testsPassed = false;
         for (let attempt = 0; attempt < 3 && !testsPassed; attempt++) {
           try {
@@ -583,11 +600,7 @@ ${suggestionBlock}`,
             testsPassed = true;
           } catch (testErr) {
             if (attempt === 2) throw testErr;
-            // Strip ANSI codes so Claude can read the output clearly
-            const rawOutput = String(testErr).replace(
-              /\x1B\[[0-9;]*[mGKHFJA-Za-z]/g,
-              "",
-            );
+            const rawOutput = stripAnsi(String(testErr));
             updateStep(2, {
               label: `Fixing tests (attempt ${attempt + 1}/3)`,
               status: "running",
@@ -607,28 +620,23 @@ If tests are genuinely failing, fix the source code or tests. Only modify test f
             if (diagnosis.includes("TESTS_PASSING")) {
               testsPassed = true;
             } else {
-              updateStep(2, {
-                label: `Re-running ${testCmd}`,
-                status: "running",
-              });
+              updateStep(2, { label: `Re-running ${testCmd}`, status: "running" });
             }
           }
         }
-
         updateStep(2, { label: "Tests passed", status: "done" });
+      } catch (err) {
+        updateStep(2, { status: "error", detail: String(err) });
+        throw err;
       }
-    } catch (err) {
-      updateStep(2, { status: "error", detail: String(err) });
-      setPhase({ type: "error", message: String(err) });
-      return;
-    }
+    };
 
-    // ── step 3: documentation ───────────────────────────────────────────────
-    updateStep(3, { status: "running" });
-    try {
-      const remote = (await getPrimaryRemote(cwd)) ?? "origin";
-      const docAnalysis = await claudeRun(
-        `Get the list of changed files: git diff --name-only ${remote}/main...HEAD
+    const runDocs = async () => {
+      updateStep(3, { status: "running" });
+      try {
+        const remote = (await getPrimaryRemote(cwd)) ?? "origin";
+        const docAnalysis = await claudeRun(
+          `Get the list of changed files: git diff --name-only ${remote}/main...HEAD
 
 For each changed file check:
 - Is there a corresponding entry within docs/?
@@ -638,128 +646,105 @@ For each changed file check:
 If no gaps are found, respond with exactly: NO_GAPS
 
 If gaps exist, list them with specific file paths and what needs updating. Be concise.`,
-        cwd,
-        (l) => appendOutput(3, l),
-      );
-
-      if (docAnalysis.includes("NO_GAPS")) {
-        updateStep(3, { label: "Documentation up to date", status: "done" });
-      } else {
-        updateStep(3, {
-          status: "waiting",
-          outputLines: docAnalysis.split("\n").slice(0, 20),
-        });
-        const choice = await askUser(
-          "Documentation gaps found. Which source is correct?",
-          [
-            { key: "c", label: "c — code is correct, update the docs" },
-            { key: "d", label: "d — docs are correct, update the code" },
-            { key: "s", label: "s — skip documentation step" },
-          ],
+          cwd,
+          (l) => appendOutput(3, l),
         );
 
-        if (choice === "s") {
-          updateStep(3, { label: "Documentation skipped", status: "skipped" });
+        if (docAnalysis.includes("NO_GAPS")) {
+          updateStep(3, { label: "Documentation up to date", status: "done" });
         } else {
           updateStep(3, {
-            label: "Updating documentation…",
-            status: "running",
+            status: "waiting",
+            outputLines: docAnalysis.split("\n").slice(0, 20),
           });
-          await claudeRun(
-            `Update the documentation based on the user's decision.
+          const choice = await askUser(
+            "Documentation gaps found. Which source is correct?",
+            [
+              { key: "c", label: "c — code is correct, update the docs" },
+              { key: "d", label: "d — docs are correct, update the code" },
+              { key: "s", label: "s — skip documentation step" },
+            ],
+          );
+
+          if (choice === "s") {
+            updateStep(3, { label: "Documentation skipped", status: "skipped" });
+          } else {
+            updateStep(3, { label: "Updating documentation…", status: "running" });
+            await claudeRun(
+              `Update the documentation based on the user's decision.
 User says: ${choice === "c" ? "the code is correct — update the docs to match the code" : "the docs are correct — update the code to match the docs"}.
 
 Gaps identified:
 ${docAnalysis}
 
 Apply the changes now.`,
-            cwd,
-            (l) => appendOutput(3, l),
-          );
+              cwd,
+              (l) => appendOutput(3, l),
+            );
 
-          updateStep(3, { status: "waiting" });
-          const approval = await askUser("Approve documentation changes?", [
-            { key: "y", label: "y — approve and continue" },
-            { key: "n", label: "n — revert doc changes" },
-          ]);
+            updateStep(3, { status: "waiting" });
+            const approval = await askUser("Approve documentation changes?", [
+              { key: "y", label: "y — approve and continue" },
+              { key: "n", label: "n — revert doc changes" },
+            ]);
 
-          if (approval === "n") {
-            await run(`git checkout -- .`, { cwd });
-            updateStep(3, { label: "Doc changes reverted", status: "skipped" });
-          } else {
-            updateStep(3, { label: "Documentation updated", status: "done" });
+            if (approval === "n") {
+              await run(`git checkout -- .`, { cwd });
+              updateStep(3, { label: "Doc changes reverted", status: "skipped" });
+            } else {
+              updateStep(3, { label: "Documentation updated", status: "done" });
+            }
           }
         }
+      } catch (err) {
+        updateStep(3, { status: "error", detail: String(err) });
+        throw err;
       }
-    } catch (err) {
-      updateStep(3, { status: "error", detail: String(err) });
-      setPhase({ type: "error", message: String(err) });
-      return;
-    }
+    };
 
-    // ── step 4: lint ────────────────────────────────────────────────────────
-    updateStep(4, { status: "running" });
-    try {
-      let cfg = await loadGlobalConfig();
-      let lintCmds = cfg.lintCommands;
-
-      if (!lintCmds || lintCmds.length === 0) {
-        updateStep(4, {
-          label: "Lint commands not configured",
-          status: "waiting",
-        });
-        const lintInput = await askTextInput(
-          "Enter lint commands, comma-separated (e.g. pnpm lint, pnpm typecheck):",
-        );
-        if (!lintInput) {
-          updateStep(4, { label: "Lint skipped", status: "skipped" });
-          lintCmds = [];
-        } else {
-          lintCmds = lintInput
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
-          await saveGlobalConfig({ lintCommands: lintCmds });
-        }
-      }
-
-      for (const lintCmd of lintCmds) {
-        updateStep(4, { label: `Running ${lintCmd}`, status: "running" });
-        let passed = false;
-        for (let attempt = 0; attempt < 3 && !passed; attempt++) {
-          try {
-            await runLines(lintCmd, { cwd }, (l) => appendOutput(4, l));
-            passed = true;
-          } catch (lintErr) {
-            if (attempt === 2)
-              throw new Error(
-                `${lintCmd} failed after 3 attempts:\n${stripAnsi(String(lintErr))}`,
-              );
-            updateStep(4, {
-              label: `Fixing lint errors (attempt ${attempt + 1}/3)`,
-              status: "running",
-            });
-            await claudeRun(
-              `The linter failed with this output:
+    const runLint = async () => {
+      if (lintCmds.length === 0) return;
+      try {
+        for (const lintCmd of lintCmds) {
+          updateStep(4, { label: `Running ${lintCmd}`, status: "running" });
+          let passed = false;
+          for (let attempt = 0; attempt < 3 && !passed; attempt++) {
+            try {
+              await runLines(lintCmd, { cwd }, (l) => appendOutput(4, l));
+              passed = true;
+            } catch (lintErr) {
+              if (attempt === 2)
+                throw new Error(
+                  `${lintCmd} failed after 3 attempts:\n${stripAnsi(String(lintErr))}`,
+                );
+              updateStep(4, {
+                label: `Fixing lint errors (attempt ${attempt + 1}/3)`,
+                status: "running",
+              });
+              await claudeRun(
+                `The linter failed with this output:
 
 ${stripAnsi(String(lintErr))}
 
 Fix the issues. Do not add eslint-disable comments unless it is a genuine false positive — if you do, explain why in the comment. Re-run the command after fixing.`,
-              cwd,
-              (l) => appendOutput(4, l),
-            );
-            updateStep(4, {
-              label: `Re-running ${lintCmd}`,
-              status: "running",
-            });
+                cwd,
+                (l) => appendOutput(4, l),
+              );
+              updateStep(4, { label: `Re-running ${lintCmd}`, status: "running" });
+            }
           }
         }
+        updateStep(4, { label: "All linters passed", status: "done" });
+      } catch (err) {
+        updateStep(4, { status: "error", detail: String(err) });
+        throw err;
       }
+    };
 
-      updateStep(4, { label: "All linters passed", status: "done" });
-    } catch (err) {
-      updateStep(4, { status: "error", detail: String(err) });
-      setPhase({ type: "error", message: String(err) });
+    const parallelResults = await Promise.allSettled([runTests(), runDocs(), runLint()]);
+    const firstFailure = parallelResults.find((r) => r.status === "rejected");
+    if (firstFailure) {
+      setPhase({ type: "error", message: String((firstFailure as PromiseRejectedResult).reason) });
       return;
     }
 
@@ -866,7 +851,20 @@ ${branchDiff}`,
         });
         const { stdout: log } = await run("git log --oneline -10", { cwd });
         const suggestion = await claudeRun(
-          `Review this PR description against the current branch changes. If it accurately reflects what the PR does, return exactly: NO_CHANGES\n\nIf improvements are needed, return the complete updated PR body in markdown. Nothing else.\n\nCurrent description:\n${existingPr.body}\n\nRecent commits:\n${log}`,
+          `Review this PR description against the current branch changes. If it accurately reflects what the PR does, return exactly: NO_CHANGES
+
+If improvements are needed, return the complete updated PR body in markdown.
+
+Output rules — these are strict:
+- Output the updated PR body only. No preamble, no analysis, no commentary.
+- Do NOT prefix with any explanation of what changed or why.
+- The very first character of your reply must be the first character of the PR body.
+
+Current description:
+${existingPr.body}
+
+Recent commits:
+${log}`,
           cwd,
           (l) => appendOutput(6, l),
         );
@@ -900,15 +898,15 @@ ${branchDiff}`,
   ]);
 
   useEffect(() => {
-    void execute();
+    void execute().catch((err) => setPhase({ type: "error", message: String(err) }));
   }, [execute]);
 
   useEffect(() => {
-    if (phase.type === "done") {
+    if (phase.type === "done" && isVisible) {
       const t = setTimeout(onDone, 2000);
       return () => clearTimeout(t);
     }
-  }, [phase.type, onDone]);
+  }, [phase.type, isVisible, onDone]);
 
   // ─── render ────────────────────────────────────────────────────────────────
 
