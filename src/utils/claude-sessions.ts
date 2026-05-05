@@ -57,7 +57,7 @@ function emit(entry: Entry): void {
   for (const sub of entry.subscribers) sub(state);
 }
 
-export function startSession(worktreePath: string, cols: number, rows: number, initialPrompt?: string): void {
+export function startSession(worktreePath: string, cols: number, rows: number, initialPrompt?: string, sessionName?: string): void {
   if (sessions.has(worktreePath)) return;
 
   if (!exitHandlerRegistered) {
@@ -67,7 +67,10 @@ export function startSession(worktreePath: string, cols: number, rows: number, i
 
   const term = new Terminal({ cols, rows, allowProposedApi: true });
 
-  const proc = pty.spawn("claude", initialPrompt ? [initialPrompt] : [], {
+  const args: string[] = [];
+  if (sessionName) args.push("-n", sessionName);
+  if (initialPrompt) args.push(initialPrompt);
+  const proc = pty.spawn("claude", args, {
     name: "xterm-color",
     cols,
     rows,

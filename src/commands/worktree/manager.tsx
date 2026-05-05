@@ -306,6 +306,7 @@ export function WorktreeManager({ onBack }: Props) {
                 isNew
                   ? `Analyse all changes on this branch. Run \`git diff --stat ${ref}\` for committed changes, \`git diff --staged\` for staged changes, and \`git diff\` for unstaged changes. Then give me a concise summary of what has changed.`
                   : undefined,
+                wt.branch,
               );
               subscribeIfNeeded(wt.path);
               acknowledgeSession(wt.path);

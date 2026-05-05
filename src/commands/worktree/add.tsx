@@ -142,12 +142,14 @@ export function WorktreeAdd({ name, onDone }: Props) {
     void execute();
   }, [execute]);
 
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
   useEffect(() => {
-    if (phase.type === "done" && onDone) {
-      const t = setTimeout(onDone, 1000);
+    if (phase.type === "done") {
+      const t = setTimeout(() => onDoneRef.current?.(), 1000);
       return () => clearTimeout(t);
     }
-  }, [phase.type, onDone]);
+  }, [phase.type]);
 
   return (
     <Box flexDirection="column" padding={1} gap={1}>
