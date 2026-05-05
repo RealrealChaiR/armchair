@@ -4,16 +4,16 @@ Terminal-based dev tools written in TypeScript using [Ink](https://github.com/va
 
 ## Installation
 
-Requires [pnpm](https://pnpm.io/installation), Node.js, and standard C++ build tools (for `node-pty`).
+Requires [pnpm](https://pnpm.io/installation) and Node.js.
 
 ```bash
-pnpm add -g github:RealChaiR/armchair
+pnpm add -g github:RealrealChaiR/armchair --allow-build=armchair
 ```
 
 ## Upgrading
 
 ```bash
-pnpm add -g github:RealChaiR/armchair
+pnpm add -g github:RealrealChaiR/armchair --allow-build=armchair
 ```
 
 Same command — pnpm will fetch the latest commit and rebuild.
