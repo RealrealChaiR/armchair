@@ -17,6 +17,7 @@ import {
 import { killAllChildren } from "../../utils/child-registry.js";
 import {
   acknowledgeSession,
+  findPriorSession,
   getRunningSessionPaths,
   isSessionRunning,
   killAllSessions,
@@ -296,17 +297,19 @@ export function WorktreeManager({ onBack }: Props) {
         } else if (key.return) {
           const wt = screen.worktrees[screen.selectedIndex];
           if (wt) {
-            void getPrimaryRemote(wt.path).then((remote) => {
+            void getPrimaryRemote(wt.path).then(async (remote) => {
               const ref = `${remote ?? "origin"}/main`;
               const isNew = !isSessionRunning(wt.path);
+              const resumeId = isNew ? await findPriorSession(wt.path) : undefined;
               startSession(
                 wt.path,
                 process.stdout.columns ?? 80,
                 process.stdout.rows ?? 24,
-                isNew
+                isNew && !resumeId
                   ? `Analyse all changes on this branch. Run \`git diff --stat ${ref}\` for committed changes, \`git diff --staged\` for staged changes, and \`git diff\` for unstaged changes. Then give me a concise summary of what has changed.`
                   : undefined,
-                wt.branch,
+                isNew && !resumeId ? wt.branch : undefined,
+                resumeId,
               );
               subscribeIfNeeded(wt.path);
               acknowledgeSession(wt.path);

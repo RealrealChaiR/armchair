@@ -1,3 +1,6 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import pkg from "@xterm/headless";
@@ -57,7 +60,29 @@ function emit(entry: Entry): void {
   for (const sub of entry.subscribers) sub(state);
 }
 
-export function startSession(worktreePath: string, cols: number, rows: number, initialPrompt?: string, sessionName?: string): void {
+export async function findPriorSession(worktreePath: string): Promise<string | null> {
+  const encoded = worktreePath.replace(/\//g, "-");
+  const projectDir = path.join(os.homedir(), ".claude", "projects", encoded);
+  let files: string[];
+  try {
+    files = await fs.readdir(projectDir);
+  } catch {
+    return null;
+  }
+  const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
+  if (jsonlFiles.length === 0) return null;
+  if (jsonlFiles.length === 1) return jsonlFiles[0].slice(0, -6);
+  const withStats = await Promise.all(
+    jsonlFiles.map(async (f) => {
+      const stat = await fs.stat(path.join(projectDir, f));
+      return { id: f.slice(0, -6), mtime: stat.mtimeMs };
+    }),
+  );
+  withStats.sort((a, b) => b.mtime - a.mtime);
+  return withStats[0].id;
+}
+
+export function startSession(worktreePath: string, cols: number, rows: number, initialPrompt?: string, sessionName?: string, resumeSessionId?: string): void {
   if (sessions.has(worktreePath)) return;
 
   if (!exitHandlerRegistered) {
@@ -68,8 +93,12 @@ export function startSession(worktreePath: string, cols: number, rows: number, i
   const term = new Terminal({ cols, rows, allowProposedApi: true });
 
   const args: string[] = [];
-  if (sessionName) args.push("-n", sessionName);
-  if (initialPrompt) args.push(initialPrompt);
+  if (resumeSessionId) {
+    args.push("--resume", resumeSessionId);
+  } else {
+    if (sessionName) args.push("-n", sessionName);
+    if (initialPrompt) args.push(initialPrompt);
+  }
   const proc = pty.spawn("claude", args, {
     name: "xterm-color",
     cols,

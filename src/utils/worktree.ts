@@ -1,4 +1,4 @@
-import { access, copyFile } from "node:fs/promises";
+import { access, copyFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 
 import { run } from "./exec.js";
@@ -60,7 +60,8 @@ export async function deleteWorktree(
   worktreePath: string,
   branch: string,
 ): Promise<void> {
-  await run(`git worktree remove --force ${worktreePath}`);
+  await rm(worktreePath, { recursive: true, force: true });
+  await run("git worktree prune");
   await run(`git branch -D ${branch}`);
 }
 
