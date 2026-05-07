@@ -44,7 +44,7 @@ import {
   listWorktrees,
 } from "../../utils/worktree.js";
 import { WorktreeAdd } from "./add.js";
-import { ReadyForReview } from "./ready-for-review.js";
+import { clearIdlePipelineStore, ReadyForReview } from "./ready-for-review.js";
 
 // ─── screen types ───────────────────────────────────────────────────────────
 
@@ -351,6 +351,7 @@ export function WorktreeManager({ onBack }: Props) {
         } else if (input === "r") {
           const wt = screen.worktrees[screen.selectedIndex];
           if (wt) {
+            clearIdlePipelineStore(wt.path);
             setActiveReview(wt);
             setScreen({ type: "ready-for-review" });
           }

@@ -122,6 +122,7 @@ type PipelineStore = {
   phase: Phase;
   pendingInput: PendingInput | null;
   executing: boolean;
+  runId: number;
   resolveInput: ((key: string) => void) | null;
   resolveMultiselect: ((ids: number[]) => void) | null;
   resolveTextInput: ((value: string) => void) | null;
@@ -130,6 +131,7 @@ type PipelineStore = {
 };
 
 const pipelineStores = new Map<string, PipelineStore>();
+let nextRunId = 0;
 
 function getOrCreateStore(worktree: WorktreeInfo): PipelineStore {
   if (!pipelineStores.has(worktree.path)) {
@@ -139,6 +141,7 @@ function getOrCreateStore(worktree: WorktreeInfo): PipelineStore {
       phase: { type: "running" },
       pendingInput: null,
       executing: false,
+      runId: ++nextRunId,
       resolveInput: null,
       resolveMultiselect: null,
       resolveTextInput: null,
@@ -147,6 +150,13 @@ function getOrCreateStore(worktree: WorktreeInfo): PipelineStore {
     });
   }
   return pipelineStores.get(worktree.path)!;
+}
+
+// Called by the manager when 'r' is pressed — clears a finished store so the
+// next mount starts a fresh pipeline run rather than showing stale results.
+export function clearIdlePipelineStore(path: string): void {
+  const store = pipelineStores.get(path);
+  if (store && !store.executing) pipelineStores.delete(path);
 }
 
 function notifyStore(path: string): void {
@@ -325,8 +335,7 @@ Repeat until the rebase completes. Do not abort.`,
     try {
       const remote = (await getPrimaryRemote(cwd)) ?? "origin";
 
-      // Human-readable review — streams to outputLines
-      const reviewText = await claudeRun(
+      const jsonText = await claudeRun(
         `Get the diff: git diff ${remote}/main...HEAD -- . ':(exclude)pnpm-lock.yaml'
 Get the list of changed files: git diff --name-only ${remote}/main...HEAD
 
@@ -345,35 +354,21 @@ Classify each finding:
 - medium — should fix (code smell, style)
 - low — informational only
 
-Present all findings grouped by severity. For each include: file path, line number if applicable, description, and how to fix it.`,
+Output rules — these are strict:
+- Output ONLY a single valid JSON object. No prose, no markdown, no code fences.
+- The very first character of your reply must be {
+
+Schema: {"findings":[{"id":1,"severity":"high"|"medium"|"low","file":"path/to/file.ts","line":42,"description":"what is wrong","howToFix":"exact fix needed"}]}
+
+If there are no findings output: {"findings":[]}`,
         cwd,
         (l) => appendOutput(1, l),
       );
 
-      // Extract structured findings
-      updateStep(1, { label: "Parsing review findings…", status: "running" });
-      const jsonText = await claudeRun(
-        `Extract the code review findings below into JSON. Return ONLY valid JSON, no other text.
-
-Schema: {"findings":[{"id":1,"severity":"high"|"medium"|"low","file":"path/to/file.ts","line":42,"description":"what is wrong","howToFix":"exact fix needed"}]}
-
-If there are no findings return: {"findings":[]}
-
-Review:
-${reviewText}`,
-        cwd,
-      );
-
       let findings: ReviewFinding[] = [];
       try {
-        // Strip markdown code fences if Claude wrapped the response
-        const stripped = jsonText
-          .trim()
-          .replace(/^```(?:json)?\s*/i, "")
-          .replace(/\s*```$/, "");
-        // Extract the first JSON object in case there's surrounding text
-        const match = stripped.match(/\{[\s\S]*\}/);
-        const parsed = JSON.parse(match ? match[0] : stripped) as {
+        const match = jsonText.trim().match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(match ? match[0] : jsonText.trim()) as {
           findings: ReviewFinding[];
         };
         findings = parsed.findings ?? [];
@@ -514,35 +509,26 @@ ${suggestionBlock}`,
       if (!testCmd) return;
       updateStep(2, { label: `Running ${testCmd}`, status: "running" });
       try {
-        let testsPassed = false;
-        for (let attempt = 0; attempt < 3 && !testsPassed; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             await runLines(testCmd, { cwd }, (l) => appendOutput(2, l));
-            testsPassed = true;
+            break;
           } catch (testErr) {
             if (attempt === 2) throw testErr;
-            const rawOutput = stripAnsi(String(testErr));
             updateStep(2, {
               label: `Fixing tests (attempt ${attempt + 1}/3)`,
               status: "running",
             });
-            const diagnosis = await claudeRun(
-              `The test command '${testCmd}' exited with a non-zero code. Output:
+            await claudeRun(
+              `The test command '${testCmd}' failed. Output:
 
-${rawOutput}
+${stripAnsi(String(testErr))}
 
-First determine if tests are actually failing or if the exit is spurious (all tests passed but the runner exited non-zero due to coverage thresholds, post-test hooks, etc.).
-
-If all tests are passing respond with exactly: TESTS_PASSING
-If tests are genuinely failing, fix the source code or tests. Only modify test files if the test itself is wrong. Run the tests after fixing to confirm they pass.`,
+Fix the failing tests. Only modify test files if the test itself is wrong. Run the tests after fixing to confirm they pass.`,
               cwd,
               (l) => appendOutput(2, l),
             );
-            if (diagnosis.includes("TESTS_PASSING")) {
-              testsPassed = true;
-            } else {
-              updateStep(2, { label: `Re-running ${testCmd}`, status: "running" });
-            }
+            updateStep(2, { label: `Re-running ${testCmd}`, status: "running" });
           }
         }
         updateStep(2, { label: "Tests passed", status: "done" });
@@ -836,12 +822,13 @@ export function ReadyForReview({
 
   // Force re-render whenever the store notifies
   const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const { runId } = store;
   useEffect(() => {
     store.subscribers.add(rerender);
     rerender();
     return () => { store.subscribers.delete(rerender); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  }, [path, runId]);
 
   const { steps, phase, pendingInput } = store;
 
@@ -855,13 +842,13 @@ export function ReadyForReview({
         ? "reviewed"
         : phase.type === "error"
           ? null
-          : pendingInput?.type === "multiselect"
+          : pendingInput?.type != null
             ? "needs-input"
             : "reviewing";
     onStatusChangeRef.current(status);
     // onStatusChangeRef is a ref — intentionally omitted from deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase.type, pendingInput?.type]);
+  }, [phase.type, pendingInput?.type, runId]);
 
   // Keep the multiselect cursor within the visible scroll window
   const termRows = stdout?.rows ?? 24;
@@ -965,7 +952,7 @@ export function ReadyForReview({
       pipelineSetPhase(path, { type: "error", message: String(err) }),
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  }, [path, runId]);
 
   // ─── end pipeline ────────────────────────────────────────────────────────────
 
