@@ -187,6 +187,25 @@ function pipelineSetPendingInput(path: string, input: PendingInput | null): void
   notifyStore(path);
 }
 
+function killPipeline(path: string): void {
+  const store = pipelineStores.get(path);
+  if (!store) return;
+  // Unblock pending user-input promises so the async chain drains cleanly
+  const { resolveInput, resolveMultiselect, resolveTextInput } = store;
+  store.resolveInput = null;
+  store.resolveMultiselect = null;
+  store.resolveTextInput = null;
+  resolveInput?.("__killed__");
+  resolveMultiselect?.([]);
+  resolveTextInput?.("");
+  store.phase = { type: "error", message: "Cancelled" };
+  store.pendingInput = null;
+  store.executing = false;
+  notifyStore(path);
+  // Remove store so the remaining async work drains as no-ops and next 'r' starts fresh
+  pipelineStores.delete(path);
+}
+
 function pipelineAskUser(
   path: string,
   prompt: string,
@@ -863,6 +882,10 @@ export function ReadyForReview({
 
   useInput(
     (input, key) => {
+      if (input === "k" && phase.type === "running") {
+        killPipeline(path);
+        return;
+      }
       if (pendingInput?.type === "multiselect") {
         if (key.upArrow) {
           pipelineSetPendingInput(path, pendingInput.type === "multiselect"
@@ -1127,7 +1150,7 @@ export function ReadyForReview({
                 ? "waiting for your input above"
                 : pendingInput?.type === "text-input"
                   ? "type command  Enter save  Esc skip"
-                  : "pipeline running…"
+                  : "k kill  Esc back"
             : "Esc back"
         }
       />
