@@ -96,14 +96,38 @@ export async function fetchAndUpdateMain(
   mainBranchPath: string,
 ): Promise<void> {
   await run(`git fetch ${remote}`);
+  try {
+    await access(mainBranchPath);
+  } catch {
+    return;
+  }
   await run(`git merge --ff-only ${remote}/main`, { cwd: mainBranchPath });
+}
+
+export async function hasRemoteTrackingBranch(
+  remote: string,
+  name: string,
+): Promise<boolean> {
+  try {
+    await run(`git rev-parse --verify refs/remotes/${remote}/${name}`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function addWorktree(
   name: string,
   destPath: string,
+  remote?: string,
 ): Promise<void> {
-  await run(`git worktree add -b ${name} ${destPath} main`);
+  if (remote) {
+    await run(
+      `git worktree add --track -b ${name} ${destPath} ${remote}/${name}`,
+    );
+  } else {
+    await run(`git worktree add -b ${name} ${destPath} main`);
+  }
 }
 
 export async function copyEnvFile(

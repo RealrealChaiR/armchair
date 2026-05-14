@@ -12,6 +12,7 @@ import {
   getMainBranchWorktreePath,
   getMainWorktreePath,
   getPrimaryRemote,
+  hasRemoteTrackingBranch,
 } from "../../utils/worktree.js";
 
 type StepStatus = "pending" | "running" | "done" | "error";
@@ -99,8 +100,17 @@ export function WorktreeAdd({ name, onDone }: Props) {
       updateStep(2, {
         label: `Creating worktree at ${path.relative(process.cwd(), destPath)}`,
       });
-      await addWorktree(name, destPath);
-      updateStep(2, { status: "done" });
+      const trackingRemote =
+        remote && (await hasRemoteTrackingBranch(remote, name))
+          ? remote
+          : undefined;
+      await addWorktree(name, destPath, trackingRemote);
+      updateStep(2, {
+        status: "done",
+        label: trackingRemote
+          ? `Created worktree from ${trackingRemote}/${name}`
+          : `Created worktree at ${path.relative(process.cwd(), destPath)}`,
+      });
     } catch (err) {
       updateStep(2, { status: "error", detail: String(err) });
       setPhase({ type: "error", message: String(err) });
